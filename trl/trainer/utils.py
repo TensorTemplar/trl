@@ -343,7 +343,7 @@ class RewardDataCollatorWithPadding:
     """
 
     tokenizer: PreTrainedTokenizerBase
-    padding: Union[bool, str] = True
+    padding: Union[bool, str] = "max_length"
     max_length: Optional[int] = None
     pad_to_multiple_of: Optional[int] = None
     return_tensors: str = "pt"
