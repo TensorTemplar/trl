@@ -155,6 +155,7 @@ class SFTTrainer(Trainer):
         model_init_kwargs: Optional[Dict] = None,
         dataset_kwargs: Optional[Dict] = None,
         eval_packing: Optional[bool] = None,
+        gradient_checkpointing_kwargs: Optional[Dict] = None,
     ):
         if args is None:
             output_dir = "tmp_trainer"
@@ -165,6 +166,12 @@ class SFTTrainer(Trainer):
             # Manually copy token values as TrainingArguments.to_dict() redacts them
             args_as_dict.update({k: getattr(args, k) for k in args_as_dict.keys() if k.endswith("_token")})
             args = SFTConfig(**args_as_dict)
+
+        if gradient_checkpointing_kwargs is not None:
+            warnings.warn(
+                "You passed `gradient_checkpointing_kwargs` to the SFTTrainer, the value you passed will override the one in the `SFTConfig`."
+            )
+            args.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
 
         if neftune_noise_alpha is not None:
             warnings.warn(
