@@ -146,8 +146,14 @@ class DPOConfig(TrainingArguments):
             for saving memory and speeding up training by not computing the logits for all tokens, especially in scenarios
             when working with very long prompts where labels are -ignored (-100).
             [Read more](https://huggingface.co/docs/transformers/main/model_doc/llama#transformers.LlamaForCausalLM)
+        bf16 (bool, inherited): Whether to use bf16 (mixed) precision instead of 32-bit
     """
+    # Inherited from TrainingArguments
+    bf16: bool = TrainingArguments.bf16
+    disable_dropout: bool = TrainingArguments.disable_dropout
+    padding_value: Optional[int] = TrainingArguments.padding_value
 
+    # DPOConfig specific
     learning_rate: float = 1e-6
     beta: float = 0.1
     label_smoothing: float = 0.0

@@ -29,12 +29,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import transformers
 from accelerate import PartialState
-from accelerate.utils import is_deepspeed_available, tqdm
 from datasets import Dataset
 from packaging import version
 from torch.utils.data import DataLoader
 from transformers import (
-    AutoModelForCausalLM,
     BaseImageProcessor,
     DataCollator,
     FeatureExtractionMixin,
@@ -45,14 +43,12 @@ from transformers import (
     is_wandb_available,
 )
 from transformers.data.data_collator import DataCollatorMixin
-from transformers.models.auto.modeling_auto import MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalLoopOutput
 from transformers.utils import is_peft_available
 from transformers.utils.deprecation import deprecate_kwarg
 
 from ..data_utils import maybe_apply_chat_template, maybe_extract_prompt
-from ..models import PreTrainedModelWrapper, create_reference_model
 from .callbacks import SyncRefModelCallback
 from .dpo_config import DPOConfig, FDivergenceConstants, FDivergenceType
 from .utils import (
@@ -60,7 +56,6 @@ from .utils import (
     cap_exp,
     disable_dropout_in_model,
     generate_model_card,
-    pad,
     pad_to_length,
     peft_module_casting_to_bf16,
 )
@@ -72,9 +67,6 @@ if is_peft_available():
 
 if is_wandb_available():
     import wandb
-
-if is_deepspeed_available():
-    import deepspeed
 
 
 @dataclass
@@ -116,42 +108,6 @@ class PreferenceCollator(DataCollatorMixin):
 
     pad_token_id: int
     return_tensors: str = "pt"
-
-    def torch_call(self, examples: list[Union[list[int], Any, dict[str, Any]]]) -> dict[str, Any]:
-        # Convert to tensor
-        prompt_input_ids = [torch.tensor(example["prompt_input_ids"]) for example in examples]
-        prompt_attention_mask = [torch.ones_like(input_ids) for input_ids in prompt_input_ids]
-        chosen_input_ids = [torch.tensor(example["chosen_input_ids"]) for example in examples]
-        chosen_attention_mask = [torch.ones_like(input_ids) for input_ids in chosen_input_ids]
-        rejected_input_ids = [torch.tensor(example["rejected_input_ids"]) for example in examples]
-        rejected_attention_mask = [torch.ones_like(input_ids) for input_ids in rejected_input_ids]
-        if "pixel_values" in examples[0]:
-            pixel_values = [torch.tensor(example["pixel_values"]) for example in examples]
-        if "pixel_attention_mask" in examples[0]:
-            pixel_attention_mask = [torch.tensor(example["pixel_attention_mask"]) for example in examples]
-        if "ref_chosen_logps" in examples[0] and "ref_rejected_logps" in examples[0]:
-            ref_chosen_logps = torch.tensor([example["ref_chosen_logps"] for example in examples])
-            ref_rejected_logps = torch.tensor([example["ref_rejected_logps"] for example in examples])
-
-        # Pad
-        output = {}
-        output["prompt_input_ids"] = pad(prompt_input_ids, padding_value=self.pad_token_id, padding_side="left")
-        output["prompt_attention_mask"] = pad(prompt_attention_mask, padding_value=0, padding_side="left")
-        output["chosen_input_ids"] = pad(chosen_input_ids, padding_value=self.pad_token_id)
-        output["chosen_attention_mask"] = pad(chosen_attention_mask, padding_value=0)
-        output["rejected_input_ids"] = pad(rejected_input_ids, padding_value=self.pad_token_id)
-        output["rejected_attention_mask"] = pad(rejected_attention_mask, padding_value=0)
-        if "pixel_values" in examples[0]:
-            output["pixel_values"] = pad(pixel_values, padding_value=0.0)
-        if "pixel_attention_mask" in examples[0]:
-            output["pixel_attention_mask"] = pad(pixel_attention_mask, padding_value=0)
-        if "image_sizes" in examples[0]:
-            output["image_sizes"] = torch.tensor([example["image_sizes"] for example in examples])
-        if "ref_chosen_logps" in examples[0] and "ref_rejected_logps" in examples[0]:
-            output["ref_chosen_logps"] = ref_chosen_logps
-            output["ref_rejected_logps"] = ref_rejected_logps
-
-        return output
 
 
 class DPOTrainer(Trainer):
@@ -195,16 +151,21 @@ class DPOTrainer(Trainer):
 
     _tag_names = ["trl", "dpo"]
 
+    @staticmethod
+    def _make_inputs_require_grad(module, input, output):
+        """Hook to make inputs require gradients for gradient checkpointing."""
+        output.requires_grad_(True)
+
     @deprecate_kwarg(
         "tokenizer", "0.16.0", "processing_class", warn_if_greater_or_equal_version=True, raise_if_both_names=True
     )
     def __init__(
         self,
-        model: Optional[Union[PreTrainedModel, nn.Module, str]] = None,
-        ref_model: Optional[Union[PreTrainedModel, nn.Module, str]] = None,
+        model: Union[PreTrainedModel, nn.Module],
+        train_dataset: Dataset,
+        ref_model: Optional[Union[PreTrainedModel, nn.Module]] = None,
         args: Optional[DPOConfig] = None,
         data_collator: Optional[DataCollator] = None,
-        train_dataset: Optional[Dataset] = None,
         eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
         processing_class: Optional[
             Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin]
@@ -219,65 +180,18 @@ class DPOTrainer(Trainer):
         if model is None:
             raise ValueError("No model provided. Please provide a model to train.")
 
-        if not isinstance(model, str) and ref_model is model:
+        if ref_model is model:
             raise ValueError(
                 "`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the "
-                "same as `model`, you must mass a copy of it, or `None` if you use peft."
+                "same as `model`, you must pass a copy of it."
             )
-
-        if args.model_init_kwargs is None:
-            model_init_kwargs = {}
-        elif not isinstance(model, str):
-            raise ValueError(
-                "You passed model_init_kwargs to the DPOTrainer/DPOConfig, but your model is already instantiated."
-            )
-        else:
-            model_init_kwargs = args.model_init_kwargs
-            torch_dtype = model_init_kwargs.get("torch_dtype")
-            if torch_dtype is not None:
-                # Convert to `torch.dtype` if an str is passed
-                if isinstance(torch_dtype, str) and torch_dtype != "auto":
-                    torch_dtype = getattr(torch, torch_dtype)
-                if torch_dtype != "auto" and not isinstance(torch_dtype, torch.dtype):
-                    raise ValueError(
-                        f"Invalid `torch_dtype` passed to the DPOConfig. Expected a string with either `torch.dtype` or 'auto', but got {torch_dtype}."
-                    )
-                model_init_kwargs["torch_dtype"] = torch_dtype
-
-        if args.ref_model_init_kwargs is None:
-            ref_model_init_kwargs = {}
-        elif not isinstance(ref_model, str):
-            raise ValueError(
-                "You passed ref_model_init_kwargs to the DPOTrainer/DPOConfig, but your ref_model is already instantiated."
-            )
-        else:
-            ref_model_init_kwargs = args.ref_model_init_kwargs
-            torch_dtype = ref_model_init_kwargs.get("torch_dtype")
-            if torch_dtype is not None:
-                # Convert to `torch.dtype` if an str is passed
-                if isinstance(torch_dtype, str) and torch_dtype != "auto":
-                    torch_dtype = getattr(torch, torch_dtype)
-                if torch_dtype != "auto" and not isinstance(torch_dtype, torch.dtype):
-                    raise ValueError(
-                        f"Invalid `torch_dtype` passed to the DPOConfig. Expected a string with either `torch.dtype` or 'auto', but got {torch_dtype}."
-                    )
-                ref_model_init_kwargs["torch_dtype"] = torch_dtype
-
-        if isinstance(model, str):
-            model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
-
-        if isinstance(ref_model, str):
-            ref_model = AutoModelForCausalLM.from_pretrained(ref_model, **ref_model_init_kwargs)
-
-        # Initialize this variable to False. This helps tracking the case when `peft_module_casting_to_bf16`
-        # has been called in order to properly call autocast if needed.
-        self._peft_has_been_casted_to_bf16 = False
 
         if not is_peft_available() and peft_config is not None:
             raise ValueError(
                 "PEFT is not installed and you passed a `peft_config` in the trainer's kwargs, please install it to use the PEFT models"
             )
-        elif is_peft_available() and peft_config is not None:
+
+        if is_peft_available() and peft_config is not None:
             # if model is a peft model and we have a peft_config, we merge and unload it first
             if isinstance(model, PeftModel):
                 model = model.merge_and_unload()
@@ -307,11 +221,7 @@ class DPOTrainer(Trainer):
                 if hasattr(model, "enable_input_require_grads"):
                     model.enable_input_require_grads()
                 else:
-
-                    def make_inputs_require_grad(module, input, output):
-                        output.requires_grad_(True)
-
-                    model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+                    model.get_input_embeddings().register_forward_hook(self._make_inputs_require_grad)
 
             # get peft model with the given config
             model = get_peft_model(model, peft_config)
@@ -328,11 +238,7 @@ class DPOTrainer(Trainer):
             if hasattr(model, "enable_input_require_grads"):
                 model.enable_input_require_grads()
             else:
-
-                def make_inputs_require_grad(module, input, output):
-                    output.requires_grad_(True)
-
-                model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+                model.get_input_embeddings().register_forward_hook(self._make_inputs_require_grad)
 
         if args.generate_during_eval and not is_wandb_available():
             raise ValueError(
@@ -340,8 +246,6 @@ class DPOTrainer(Trainer):
                 " Please install `wandb` to resolve."
             )
 
-        self.is_encoder_decoder = model.config.is_encoder_decoder
-        self.is_vision_model = model.config.model_type in MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES.keys()
         self.is_peft_model = is_peft_available() and isinstance(model, PeftModel)
         self.model_adapter_name = args.model_adapter_name
         self.ref_adapter_name = args.ref_adapter_name
@@ -353,7 +257,7 @@ class DPOTrainer(Trainer):
             # The `model` with adapters turned off will be used as the reference model
             self.ref_model = None
         else:
-            self.ref_model = create_reference_model(model)
+            raise ValueError("No reference model provided.")
 
         if processing_class is None:
             raise ValueError("processing_class must be specified to tokenize a DPO dataset.")
@@ -388,11 +292,6 @@ class DPOTrainer(Trainer):
         self.max_completion_length = args.max_completion_length
         self.precompute_ref_log_probs = args.precompute_ref_log_probs
         self.use_num_logits_to_keep = args.use_num_logits_to_keep
-
-        # Since ref_logs are precomputed on the first call to get_train/eval_dataloader
-        # keep track of first called to avoid computation of future calls
-        self._precomputed_train_ref_log_probs = False
-        self._precomputed_eval_ref_log_probs = False
 
         if (
             args.loss_type in ["hinge", "ipo", "bco_pair", "sppo_hard", "nca_pair", "apo_zero", "apo_down"]
@@ -468,7 +367,7 @@ class DPOTrainer(Trainer):
                 "add_special_tokens": self.is_encoder_decoder,
             }
             train_dataset = train_dataset.map(
-                self.tokenize_row if not self.is_vision_model else self.process_row,
+                self.tokenize_row,
                 fn_kwargs=fn_kwargs,
                 num_proc=self.dataset_num_proc,
                 writer_batch_size=10,
@@ -476,7 +375,7 @@ class DPOTrainer(Trainer):
             )
             if eval_dataset is not None:
                 eval_dataset = eval_dataset.map(
-                    self.tokenize_row if not self.is_vision_model else self.process_row,
+                    self.tokenize_row,
                     fn_kwargs=fn_kwargs,
                     num_proc=self.dataset_num_proc,
                     writer_batch_size=10,
@@ -506,13 +405,6 @@ class DPOTrainer(Trainer):
                 "Your `Trainer` does not have an `accelerator` object. Consider upgrading `transformers`."
             )
 
-        # Deepspeed Zero-3 does not support precompute_ref_log_probs
-        if self.is_deepspeed_enabled:
-            if self.accelerator.state.deepspeed_plugin.zero_stage == 3 and self.precompute_ref_log_probs:
-                raise ValueError(
-                    "You cannot use `precompute_ref_log_probs=True` with Deepspeed ZeRO-3. Please set `precompute_ref_log_probs=False`."
-                )
-
         if self.ref_model is None:
             if not (self.is_peft_model or self.precompute_ref_log_probs):
                 raise ValueError(
@@ -523,10 +415,7 @@ class DPOTrainer(Trainer):
                     "You currently cannot use `ref_model=None` with TR-DPO method. Please provide `ref_model`."
                 )
         else:
-            if self.is_deepspeed_enabled:
-                self.ref_model = self._prepare_deepspeed(self.ref_model)
-            else:
-                self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
+            self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
 
         if args.sync_ref_model:
             if self.precompute_ref_log_probs:
@@ -599,192 +488,6 @@ class DPOTrainer(Trainer):
             "rejected_input_ids": rejected_input_ids,
         }
 
-    @staticmethod
-    def process_row(features, processing_class, max_prompt_length, max_completion_length, add_special_tokens):
-        """
-        Same as `tokenize_row` but for vision models. Please refer to `tokenize_row` for more information.
-        """
-        processor, tokenizer = processing_class, processing_class.tokenizer  # the processing class is a processor
-        processed_features = processor(images=features["images"], text=features["prompt"], add_special_tokens=False)
-
-        prompt_input_ids = processed_features["input_ids"][0]
-        pixel_values = processed_features["pixel_values"][0]
-        chosen_input_ids = tokenizer(features["chosen"], add_special_tokens=False)["input_ids"]
-        rejected_input_ids = tokenizer(features["rejected"], add_special_tokens=False)["input_ids"]
-
-        # Add special tokens (typically for encoder-decoder models)
-        if add_special_tokens:
-            if tokenizer.bos_token_id is not None:
-                prompt_input_ids = [tokenizer.bos_token_id] + prompt_input_ids
-            if tokenizer.eos_token_id is not None:
-                prompt_input_ids = prompt_input_ids + [tokenizer.eos_token_id]
-        chosen_input_ids = chosen_input_ids + [tokenizer.eos_token_id]
-        rejected_input_ids = rejected_input_ids + [tokenizer.eos_token_id]
-
-        # Truncate prompt and completion sequences
-        if max_prompt_length is not None:
-            prompt_input_ids = prompt_input_ids[-max_prompt_length:]
-        if max_completion_length is not None:
-            chosen_input_ids = chosen_input_ids[:max_completion_length]
-            rejected_input_ids = rejected_input_ids[:max_completion_length]
-
-        output = {
-            "prompt_input_ids": prompt_input_ids,
-            "pixel_values": pixel_values,
-            "chosen_input_ids": chosen_input_ids,
-            "rejected_input_ids": rejected_input_ids,
-        }
-
-        if "pixel_attention_mask" in processed_features:
-            output["pixel_attention_mask"] = processed_features["pixel_attention_mask"][0]
-        if "image_sizes" in processed_features:
-            output["image_sizes"] = processed_features["image_sizes"][0]
-
-        return output
-
-    def _prepare_deepspeed(self, model: PreTrainedModelWrapper):
-        # Adapted from accelerate: https://github.com/huggingface/accelerate/blob/739b135f8367becb67ffaada12fe76e3aa60fefd/src/accelerate/accelerator.py#L1473
-        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
-        config_kwargs = deepcopy(deepspeed_plugin.deepspeed_config)
-
-        if model is not None:
-            if hasattr(model, "config"):
-                hidden_size = (
-                    max(model.config.hidden_sizes)
-                    if getattr(model.config, "hidden_sizes", None)
-                    else getattr(model.config, "hidden_size", None)
-                )
-                if hidden_size is not None and config_kwargs["zero_optimization"]["stage"] == 3:
-                    # Note that `stage3_prefetch_bucket_size` can produce DeepSpeed messages like: `Invalidate trace cache @ step 0: expected module 1, but got module 0`
-                    # This is expected and is not an error, see: https://github.com/microsoft/DeepSpeed/discussions/4081
-                    config_kwargs.update(
-                        {
-                            "zero_optimization.reduce_bucket_size": hidden_size * hidden_size,
-                            "zero_optimization.stage3_param_persistence_threshold": 10 * hidden_size,
-                            "zero_optimization.stage3_prefetch_bucket_size": 0.9 * hidden_size * hidden_size,
-                        }
-                    )
-
-        # If ZeRO-3 is used, we shard both the active and reference model.
-        # Otherwise, we assume the reference model fits in memory and is initialized on each device with ZeRO disabled (stage 0)
-        if config_kwargs["zero_optimization"]["stage"] != 3:
-            config_kwargs["zero_optimization"]["stage"] = 0
-        model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
-        model.eval()
-        return model
-
-    def _set_signature_columns_if_needed(self):
-        # If `self.args.remove_unused_columns` is True, non-signature columns are removed.
-        # By default, this method sets `self._signature_columns` to the model's expected inputs.
-        # In DPOTrainer, we preprocess data, so using the model's signature columns doesn't work.
-        # Instead, we set them to the columns expected by `PreferenceCollator`, hence the override.
-        if self._signature_columns is None:
-            self._signature_columns = [
-                "prompt_input_ids",
-                "chosen_input_ids",
-                "rejected_input_ids",
-                "image_sizes",
-                "ref_chosen_logps",
-                "ref_rejected_logps",
-            ]
-
-    def get_train_dataloader(self) -> DataLoader:
-        """
-        Returns the training [`~torch.utils.data.DataLoader`].
-
-        Subclass of transformers.src.transformers.trainer.get_train_dataloader to precompute `ref_log_probs`.
-        """
-
-        if self.precompute_ref_log_probs and not self._precomputed_train_ref_log_probs:
-            batch_size = self.args.precompute_ref_batch_size or self.args.per_device_train_batch_size
-            dataloader_params = {
-                "batch_size": batch_size,
-                "collate_fn": self.data_collator,
-                "num_workers": self.args.dataloader_num_workers,
-                "pin_memory": self.args.dataloader_pin_memory,
-                "shuffle": False,
-            }
-
-            # prepare dataloader
-            data_loader = self.accelerator.prepare(DataLoader(self.train_dataset, **dataloader_params))
-
-            ref_chosen_logps = []
-            ref_rejected_logps = []
-            for padded_batch in tqdm(iterable=data_loader, desc="Train dataset reference log probs"):
-                ref_chosen_logp, ref_rejected_logp = self.compute_ref_log_probs(padded_batch)
-                ref_chosen_logp, ref_rejected_logp = self.accelerator.gather_for_metrics(
-                    (ref_chosen_logp, ref_rejected_logp)
-                )
-                ref_chosen_logps.append(ref_chosen_logp.cpu())
-                ref_rejected_logps.append(ref_rejected_logp.cpu())
-
-                # Unnecessary cache clearing to avoid OOM
-                torch.cuda.empty_cache()
-                self.accelerator.free_memory()
-
-            all_ref_chosen_logps = torch.cat(ref_chosen_logps).float().numpy()
-            all_ref_rejected_logps = torch.cat(ref_rejected_logps).float().numpy()
-
-            self.train_dataset = self.train_dataset.add_column(name="ref_chosen_logps", column=all_ref_chosen_logps)
-            self.train_dataset = self.train_dataset.add_column(
-                name="ref_rejected_logps", column=all_ref_rejected_logps
-            )
-
-            self._precomputed_train_ref_log_probs = True
-
-        return super().get_train_dataloader()
-
-    def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
-        """
-        Returns the evaluation [`~torch.utils.data.DataLoader`].
-
-        Subclass of transformers.src.transformers.trainer.get_eval_dataloader to precompute `ref_log_probs`.
-
-        Args:
-            eval_dataset (`torch.utils.data.Dataset`, *optional*):
-                If provided, will override `self.eval_dataset`. If it is a [`~datasets.Dataset`], columns not accepted
-                by the `model.forward()` method are automatically removed. It must implement `__len__`.
-        """
-        if eval_dataset is None and self.eval_dataset is None:
-            raise ValueError("Trainer: evaluation requires an eval_dataset.")
-        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
-
-        if self.precompute_ref_log_probs and not self._precomputed_eval_ref_log_probs:
-            batch_size = self.args.precompute_ref_batch_size or self.args.per_device_eval_batch_size
-            dataloader_params = {
-                "batch_size": batch_size,
-                "collate_fn": self.data_collator,
-                "num_workers": self.args.dataloader_num_workers,
-                "pin_memory": self.args.dataloader_pin_memory,
-                "shuffle": False,
-            }
-
-            # prepare dataloader
-            data_loader = self.accelerator.prepare(DataLoader(eval_dataset, **dataloader_params))
-
-            ref_chosen_logps = []
-            ref_rejected_logps = []
-            for padded_batch in tqdm(iterable=data_loader, desc="Eval dataset reference log probs"):
-                ref_chosen_logp, ref_rejected_logp = self.compute_ref_log_probs(padded_batch)
-                ref_chosen_logp, ref_rejected_logp = self.accelerator.gather_for_metrics(
-                    (ref_chosen_logp, ref_rejected_logp)
-                )
-                ref_chosen_logps.append(ref_chosen_logp.cpu())
-                ref_rejected_logps.append(ref_rejected_logp.cpu())
-
-            all_ref_chosen_logps = torch.cat(ref_chosen_logps).float().numpy()
-            all_ref_rejected_logps = torch.cat(ref_rejected_logps).float().numpy()
-
-            eval_dataset = eval_dataset.add_column(name="ref_chosen_logps", column=all_ref_chosen_logps)
-            eval_dataset = eval_dataset.add_column(name="ref_rejected_logps", column=all_ref_rejected_logps)
-
-            # Save calculated ref_chosen_logps and ref_rejected_logps to the eval_dataset for subsequent runs
-            if self.eval_dataset is not None:
-                self.eval_dataset = eval_dataset
-            self._precomputed_eval_ref_log_probs = True
-
-        return super().get_eval_dataloader(eval_dataset=eval_dataset)
-
     @contextmanager
     def null_ref_context(self):
         """Context manager for handling null reference model (that is, peft adapter manipulation)."""
@@ -810,56 +513,34 @@ class DPOTrainer(Trainer):
 
     @staticmethod
     def concatenated_inputs(
-        batch: dict[str, Union[list, torch.LongTensor]], padding_value: int
+        batch: dict[str, Union[list, torch.LongTensor]], 
+        padding_value: int
     ) -> dict[str, torch.LongTensor]:
         """
-        Concatenate the `chosen` and `rejected` inputs from the batch into a single tensor for both the prompt
-        and completion sequences.
+        Concatenate the chosen and rejected inputs into a single tensor for both prompt and completion sequences.
 
         Args:
-            batch (`dict[str, Union[list, torch.LongTensor]]`):
-                A batch of input data. The batch must contain the following keys:
-
-                - `"prompt_input_ids"`: Tensor of shape `(batch_size, prompt_length)` representing the prompt input IDs.
-                - `"chosen_input_ids"`: Tensor of shape `(batch_size, chosen_length)` representing the chosen completion input IDs.
-                - `"rejected_input_ids"`: Tensor of shape `(batch_size, rejected_length)` representing the rejected completion input IDs.
-                - `"prompt_pixel_values"` (optional): Tensor for pixel values, if available.
-                - `"prompt_pixel_attention_mask"` (optional): Tensor for pixel attention masks, if available.
-
-            padding_value (`int`):
-                The padding value to use for the concatenated completion sequences (`chosen_input_ids` and
-                `rejected_input_ids`).
+            batch: Dictionary containing:
+                - prompt_input_ids: Tensor of shape (batch_size, prompt_length)
+                - prompt_attention_mask: Tensor of shape (batch_size, prompt_length)
+                - chosen_input_ids: Tensor of shape (batch_size, chosen_length)
+                - chosen_attention_mask: Tensor of shape (batch_size, chosen_length)
+                - rejected_input_ids: Tensor of shape (batch_size, rejected_length)
+                - rejected_attention_mask: Tensor of shape (batch_size, rejected_length)
+            padding_value: Value to use for padding the concatenated sequences
 
         Returns:
-            `dict[str, torch.LongTensor]`: A dictionary containing:
-
-                - `"prompt_input_ids"`: Concatenated prompt input IDs of shape `(2 * batch_size, prompt_length)`.
-                - `"completion_input_ids"`: Concatenated chosen and rejected completion input IDs of shape `(2 * batch_size, max_completion_length)`.
-                - `"prompt_attention_mask"`: Concatenated prompt attention masks of shape `(2 * batch_size, prompt_length)`.
-                - `"completion_attention_mask"`: Concatenated chosen and rejected attention masks of shape `(2 * batch_size, max_completion_length)`.
-                - `"pixel_values"` (optional): Concatenated pixel values if `"prompt_pixel_values"` are present.
-                - `"pixel_attention_mask"` (optional): Concatenated pixel attention masks if `"prompt_pixel_attention_mask"` are present.
-
-        Notes:
-            The completion input IDs and attention masks are padded to the maximum completion length of the chosen
-            or rejected sequences.
+            Dictionary containing:
+                - prompt_input_ids: Concatenated prompts of shape (2 * batch_size, prompt_length)
+                - prompt_attention_mask: Concatenated masks of shape (2 * batch_size, prompt_length)
+                - completion_input_ids: Concatenated completions of shape (2 * batch_size, max_completion_length)
+                - completion_attention_mask: Concatenated masks of shape (2 * batch_size, max_completion_length)
         """
-        output = {}
-
-        # For the prompt, the input_ids are the same for both the chosen and rejected responses
-        output["prompt_input_ids"] = torch.cat([batch["prompt_input_ids"], batch["prompt_input_ids"]], dim=0)
-        output["prompt_attention_mask"] = torch.cat(
-            [batch["prompt_attention_mask"], batch["prompt_attention_mask"]], dim=0
-        )
-        if "pixel_values" in batch:
-            output["pixel_values"] = torch.cat([batch["pixel_values"], batch["pixel_values"]], dim=0)
-
-        if "pixel_attention_mask" in batch:
-            output["pixel_attention_mask"] = torch.cat(
-                [batch["pixel_attention_mask"], batch["pixel_attention_mask"]], dim=0
-            )
-        if "image_sizes" in batch:
-            output["image_sizes"] = torch.cat([batch["image_sizes"], batch["image_sizes"]], dim=0)
+        # For the prompt, duplicate since it's the same for both chosen and rejected
+        output = {
+            "prompt_input_ids": torch.cat([batch["prompt_input_ids"], batch["prompt_input_ids"]], dim=0),
+            "prompt_attention_mask": torch.cat([batch["prompt_attention_mask"], batch["prompt_attention_mask"]], dim=0),
+        }
 
         # Concatenate the chosen and rejected completions
         max_completion_length = max(batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1])
