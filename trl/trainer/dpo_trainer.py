@@ -1166,6 +1166,7 @@ class DPOTrainer(Trainer):
 
         # Compute the log probabilities of the labels
         labels[~loss_mask] = 0  # dummy token; we'll ignore the losses on these tokens later
+        labels = labels.clone().to(logits.device)
         per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
         per_token_logps[~loss_mask] = 0
         all_logps = per_token_logps.sum(-1)
