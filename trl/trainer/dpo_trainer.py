@@ -59,6 +59,7 @@ from .utils import (
     disable_dropout_in_model,
     generate_model_card,
     pad_to_length,
+    pad,
     peft_module_casting_to_bf16,
 )
 
