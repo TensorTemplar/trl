@@ -906,9 +906,9 @@ class DPOTrainer(Trainer):
         """
         device = self.accelerator.device
 
-        # Get the log ratios for the chosen and rejected responses
-        chosen_logratios = chosen_logps.to(device) - (not self.reference_free) * ref_chosen_logps.to(device)
-        rejected_logratios = rejected_logps.to(device) - (not self.reference_free) * ref_rejected_logps.to(device)
+        # Get the log ratios for the chosen and rejected responses, ensuring clean copies on the correct device
+        chosen_logratios = chosen_logps.clone().to(device) - (not self.reference_free) * ref_chosen_logps.clone().to(device)
+        rejected_logratios = rejected_logps.clone().to(device) - (not self.reference_free) * ref_rejected_logps.clone().to(device)
 
         if self.f_divergence_type == FDivergenceType.ALPHA_DIVERGENCE.value:
             # The alpha-divergence formula: (1 - u^-alpha) / alpha
