@@ -1133,6 +1133,8 @@ class DPOTrainer(Trainer):
                 attention_mask = attention_mask[:, : self.args.max_length]
                 loss_mask = loss_mask[:, : self.args.max_length]
 
+            input_ids = input_ids.to(model.device)
+            attention_mask = attention_mask.to(model.device)
             if self.use_num_logits_to_keep:
                 # Compute num_logits_to_keep based on loss_mask pattern:
                 # [[0, 0, 0, x, x, x, x],
