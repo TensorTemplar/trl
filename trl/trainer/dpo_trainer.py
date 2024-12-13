@@ -170,7 +170,7 @@ class DPOTrainer(Trainer):
         self,
         model: Union[PreTrainedModel, nn.Module],
         train_dataset: Dataset,
-        args: DPOTrainingConfig,
+        args: Optional[DPOTrainingConfig] = None,
         ref_model: Optional[Union[PreTrainedModel, nn.Module]] = None,
         data_collator: Optional[DataCollator] = None,
         eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
