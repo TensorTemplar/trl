@@ -1078,93 +1078,64 @@ class DPOTrainer(Trainer):
         if self.aux_loss_enabled:
             model_kwargs["output_router_logits"] = True
 
-        # Add the pixel values and attention masks for vision models
-        if "pixel_values" in concatenated_batch:
-            model_kwargs["pixel_values"] = concatenated_batch["pixel_values"]
-        if "pixel_attention_mask" in concatenated_batch:
-            model_kwargs["pixel_attention_mask"] = concatenated_batch["pixel_attention_mask"]
-        if "image_sizes" in concatenated_batch:
-            model_kwargs["image_sizes"] = concatenated_batch["image_sizes"]
+        # Concatenate the prompt and completion inputs
+        input_ids = torch.cat((concatenated_batch["prompt_input_ids"], concatenated_batch["completion_input_ids"]), dim=1)
+        attention_mask = torch.cat((concatenated_batch["prompt_attention_mask"], concatenated_batch["completion_attention_mask"]), dim=1)
+        # Mask the prompt but not the completion for the loss
+        loss_mask = torch.cat(
+            (torch.zeros_like(concatenated_batch["prompt_attention_mask"]), concatenated_batch["completion_attention_mask"]),
+            dim=1,
+        )
 
-        prompt_input_ids = concatenated_batch["prompt_input_ids"]
-        prompt_attention_mask = concatenated_batch["prompt_attention_mask"]
-        completion_input_ids = concatenated_batch["completion_input_ids"]
-        completion_attention_mask = concatenated_batch["completion_attention_mask"]
-        if self.is_encoder_decoder:
-            labels = completion_input_ids
-            labels[completion_attention_mask == 0] = self.label_pad_token_id
-            outputs = model(
-                input_ids=prompt_input_ids,
-                attention_mask=prompt_attention_mask,
-                labels=labels,  # we need the labels for the logits to be returned
-                **model_kwargs,
-            )
-            logits = outputs.logits
-            loss_mask = completion_attention_mask.bool()
-        else:
-            # Concatenate the prompt and completion inputs
-            input_ids = torch.cat((prompt_input_ids, completion_input_ids), dim=1)
-            attention_mask = torch.cat((prompt_attention_mask, completion_attention_mask), dim=1)
-            # Mask the prompt but not the completion for the loss
-            loss_mask = torch.cat(
-                (torch.zeros_like(prompt_attention_mask), completion_attention_mask),
-                dim=1,
-            )
+        # Flush left to reduce memory usage
+        # [[0, 0, x, x, x, x],  ->  [[x, x, x, x],
+        #  [0, x, x, x, 0, 0]]       [x, x, x, 0]]
+        for i in range(attention_mask.size(0)):
+            first_one_idx = torch.nonzero(attention_mask[i])[0].item()
+            input_ids[i] = torch.roll(input_ids[i], shifts=-first_one_idx)
+            attention_mask[i] = torch.roll(attention_mask[i], shifts=-first_one_idx)
+            loss_mask[i] = torch.roll(loss_mask[i], shifts=-first_one_idx)
 
-            # Flush left to reduce the memory usage
-            # [[0, 0, x, x, x, x],  ->  [[x, x, x, x],
-            #  [0, x, x, x, 0, 0]]       [x, x, x, 0]]
-            for i in range(attention_mask.size(0)):
-                first_one_idx = torch.nonzero(attention_mask[i])[0].item()
-                input_ids[i] = torch.roll(input_ids[i], shifts=-first_one_idx)
-                attention_mask[i] = torch.roll(attention_mask[i], shifts=-first_one_idx)
-                loss_mask[i] = torch.roll(loss_mask[i], shifts=-first_one_idx)
+        # Get the first column idx that is all zeros and remove every column after that
+        empty_cols = torch.sum(attention_mask, dim=0) == 0
+        first_empty_col = torch.nonzero(empty_cols)[0].item() if empty_cols.any() else attention_mask.size(1)
+        input_ids = input_ids[:, :first_empty_col]
+        attention_mask = attention_mask[:, :first_empty_col]
+        loss_mask = loss_mask[:, :first_empty_col]
 
-            # Get the first column idx that is all zeros and remove every column after that
-            empty_cols = torch.sum(attention_mask, dim=0) == 0
-            first_empty_col = torch.nonzero(empty_cols)[0].item() if empty_cols.any() else attention_mask.size(1)
-            input_ids = input_ids[:, :first_empty_col]
-            attention_mask = attention_mask[:, :first_empty_col]
-            loss_mask = loss_mask[:, :first_empty_col]
+        # Truncate right
+        if self.args.max_length is not None:
+            input_ids = input_ids[:, : self.args.max_length]
+            attention_mask = attention_mask[:, : self.args.max_length]
+            loss_mask = loss_mask[:, : self.args.max_length]
 
-            # Truncate right
-            if self.args.max_length is not None:
-                input_ids = input_ids[:, : self.args.max_length]
-                attention_mask = attention_mask[:, : self.args.max_length]
-                loss_mask = loss_mask[:, : self.args.max_length]
+        # input_ids = input_ids.to(model.device)
+        # attention_mask = attention_mask.to(model.device)
 
-            input_ids = input_ids.to(model.device)
-            attention_mask = attention_mask.to(model.device)
-            if self.use_num_logits_to_keep:
-                # Compute num_logits_to_keep based on loss_mask pattern:
-                # [[0, 0, 0, x, x, x, x],
-                #  [0, 0, 0, x, x, x, 0]]
-                #         ^ start computing logits from here ([:, -(7-3+1):])
-                first_compute_index = loss_mask.nonzero(as_tuple=True)[1].min()
-                num_logits_to_keep = loss_mask.shape[1] - first_compute_index
-                model_kwargs["num_logits_to_keep"] = num_logits_to_keep.item() + 1  # +1 for the first label
+        if self.use_num_logits_to_keep:
+            # Compute num_logits_to_keep based on loss_mask pattern:
+            # [[0, 0, 0, x, x, x, x],
+            #  [0, 0, 0, x, x, x, 0]]
+            #         ^ start computing logits from here ([:, -(7-3+1):])
+            first_compute_index = loss_mask.nonzero(as_tuple=True)[1].min()
+            num_logits_to_keep = loss_mask.shape[1] - first_compute_index
+            model_kwargs["num_logits_to_keep"] = num_logits_to_keep.item() + 1  # +1 for the first label
 
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, **model_kwargs)
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, **model_kwargs)
 
-            # Offset the logits by one to align with the labels
-            logits = outputs.logits[:, :-1, :]
-            labels = input_ids[:, 1:].clone()
-            loss_mask = loss_mask[:, 1:].bool()
+        # Offset the logits by one to align with the labels
+        logits = outputs.logits[:, :-1, :]
+        labels = input_ids[:, 1:].clone()
+        loss_mask = loss_mask[:, 1:].bool()
 
-            if self.use_num_logits_to_keep:
-                # Align labels with logits
-                # logits:    -,  -, [x2, x3, x4, x5, x6]
-                #                     ^ --------- ^       after logits[:, :-1, :]
-                # labels:   [y0, y1, y2, y3, y4, y5, y6]
-                #                         ^ --------- ^   with num_logits_to_keep=4, [:, -4:]
-                # loss_mask: [0,  0,  0,  1,  1,  1,  1]
-                labels = labels[:, -num_logits_to_keep:]
-                loss_mask = loss_mask[:, -num_logits_to_keep:]
-
-        if logits.shape[:2] != labels.shape[:2]:
-            # for llava, the returned logits include the image tokens (placed before the text tokens)
-            seq_len = labels.shape[1]
-            logits = logits[:, -seq_len:]
+        if self.use_num_logits_to_keep:
+            # Align labels with logits
+            # logits:    -,  -, [x2, x3, x4, x5, x6]
+            #                     ^ --------- ^       after logits[:, :-1, :]
+            # labels:   [y0, y1, y2, y3, y4, y5, y6]
+            #                         ^ --------- ^   with num_logits_to_keep=4, [:, -4:]
+            labels = labels[:, -num_logits_to_keep:]
+            loss_mask = loss_mask[:, -num_logits_to_keep:]
 
         # Compute the log probabilities of the labels
         labels[~loss_mask] = 0  # dummy token; we'll ignore the losses on these tokens later
