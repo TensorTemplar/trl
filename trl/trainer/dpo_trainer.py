@@ -363,8 +363,6 @@ class DPOTrainer(Trainer):
                 "processing_class": processing_class,
                 "max_prompt_length": args.max_prompt_length,
                 "max_completion_length": args.max_completion_length,
-                # for enc-dec, we add the special tokens ([bos_token] + prompt + [eos_token]; completion + [eos_token])
-                "add_special_tokens": self.is_encoder_decoder,
             }
             train_dataset = train_dataset.map(
                 self.tokenize_row,
@@ -429,7 +427,7 @@ class DPOTrainer(Trainer):
             self.running = RunningMoments(self.accelerator)
 
     @staticmethod
-    def tokenize_row(features, processing_class, max_prompt_length, max_completion_length, add_special_tokens):
+    def tokenize_row(features, processing_class, max_prompt_length, max_completion_length, add_special_tokens=False):
         """
         Tokenize a row of the dataset.
 
@@ -451,9 +449,9 @@ class DPOTrainer(Trainer):
                 `"rejected_input_ids"`.
         """
         tokenizer = processing_class  # the processing class is a tokenizer
-        prompt_input_ids = tokenizer(features["prompt"], add_special_tokens=False)["input_ids"]
-        chosen_input_ids = tokenizer(features["chosen"], add_special_tokens=False)["input_ids"]
-        rejected_input_ids = tokenizer(features["rejected"], add_special_tokens=False)["input_ids"]
+        prompt_input_ids = tokenizer(features["prompt"], add_special_tokens=add_special_tokens)["input_ids"]
+        chosen_input_ids = tokenizer(features["chosen"], add_special_tokens=add_special_tokens)["input_ids"]
+        rejected_input_ids = tokenizer(features["rejected"], add_special_tokens=add_special_tokens)["input_ids"]
 
         # Add EOS token to completions
         chosen_input_ids = chosen_input_ids + [tokenizer.eos_token_id]
@@ -519,12 +517,22 @@ class DPOTrainer(Trainer):
                 - completion_input_ids: Concatenated completions of shape (2 * batch_size, max_completion_length)
                 - completion_attention_mask: Concatenated masks of shape (2 * batch_size, max_completion_length)
         """
-        # For the prompt, duplicate since it's the same for both chosen and rejected
+        # Convert lists to tensors if needed
+        prompt_mask = (
+            batch["prompt_attention_mask"] 
+            if torch.is_tensor(batch["prompt_attention_mask"]) 
+            else torch.tensor(batch["prompt_attention_mask"])
+        )
+
+        prompt_ids = (
+            batch["prompt_input_ids"] 
+            if torch.is_tensor(batch["prompt_input_ids"]) 
+            else torch.tensor(batch["prompt_input_ids"])
+        )
+
         output = {
-            "prompt_input_ids": torch.cat([batch["prompt_input_ids"], batch["prompt_input_ids"]], dim=0),
-            "prompt_attention_mask": torch.cat(
-                [batch["prompt_attention_mask"], batch["prompt_attention_mask"]], dim=0
-            ),
+            "prompt_input_ids": torch.cat([prompt_ids, prompt_ids], dim=0),
+            "prompt_attention_mask": torch.cat([prompt_mask, prompt_mask], dim=0),
         }
 
         # Concatenate the chosen and rejected completions
