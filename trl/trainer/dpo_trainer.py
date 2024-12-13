@@ -513,6 +513,7 @@ class DPOTrainer(Trainer):
 
     def compute_ref_log_probs(self, batch: dict[str, torch.LongTensor]) -> dict:
         """Computes log probabilities of the reference model for a single padded batch of a DPO specific dataset."""
+
         compte_ref_context_manager = amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
         with torch.no_grad(), compte_ref_context_manager:
             if self.ref_model is None:
@@ -823,8 +824,8 @@ class DPOTrainer(Trainer):
             attention_mask = attention_mask[:, : self.args.max_length]
             loss_mask = loss_mask[:, : self.args.max_length]
 
-        # input_ids = input_ids.to(model.device)
-        # attention_mask = attention_mask.to(model.device)
+        input_ids = input_ids.to(self.accelerator.device)
+        attention_mask = attention_mask.to(self.accelerator.device)
 
         if self.use_num_logits_to_keep:
             # Compute num_logits_to_keep based on loss_mask pattern:
