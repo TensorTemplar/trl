@@ -71,11 +71,6 @@ if is_wandb_available():
     import wandb
 
 
-@dataclass
-class DPOTrainingConfig(DPOConfig, ModelConfig, ScriptArguments):
-    """Configuration class that combines DPO, Model and Script arguments."""
-    pass
-
 
 @dataclass
 class PreferenceCollator(DataCollatorMixin):
@@ -171,7 +166,7 @@ class DPOTrainer(Trainer):
         self,
         model: Union[PreTrainedModel, nn.Module],
         train_dataset: Dataset,
-        args: Optional[DPOTrainingConfig] = None,
+        args: Optional[Union[ScriptArguments, DPOConfig, ModelConfig]] = None,
         ref_model: Optional[Union[PreTrainedModel, nn.Module]] = None,
         data_collator: Optional[DataCollator] = None,
         eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
