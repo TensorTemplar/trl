@@ -47,7 +47,8 @@ from transformers.trainer_utils import EvalLoopOutput
 from transformers.utils import is_peft_available
 from transformers.utils.deprecation import deprecate_kwarg
 
-from trl import ModelConfig, ScriptArguments
+from trl.trainer.model_config import ModelConfig
+from trl.utils import ScriptArguments
 
 from ..data_utils import maybe_apply_chat_template, maybe_extract_prompt
 from .callbacks import SyncRefModelCallback
