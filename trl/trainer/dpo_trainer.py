@@ -19,7 +19,6 @@ import textwrap
 import warnings
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional, Union
 
@@ -513,8 +512,7 @@ class DPOTrainer(Trainer):
 
     @staticmethod
     def concatenated_inputs(
-        batch: dict[str, Union[list, torch.LongTensor]], 
-        padding_value: int
+        batch: dict[str, Union[list, torch.LongTensor]], padding_value: int
     ) -> dict[str, torch.LongTensor]:
         """
         Concatenate the chosen and rejected inputs into a single tensor for both prompt and completion sequences.
@@ -539,7 +537,9 @@ class DPOTrainer(Trainer):
         # For the prompt, duplicate since it's the same for both chosen and rejected
         output = {
             "prompt_input_ids": torch.cat([batch["prompt_input_ids"], batch["prompt_input_ids"]], dim=0),
-            "prompt_attention_mask": torch.cat([batch["prompt_attention_mask"], batch["prompt_attention_mask"]], dim=0),
+            "prompt_attention_mask": torch.cat(
+                [batch["prompt_attention_mask"], batch["prompt_attention_mask"]], dim=0
+            ),
         }
 
         # Concatenate the chosen and rejected completions
@@ -588,8 +588,12 @@ class DPOTrainer(Trainer):
         device = self.accelerator.device
 
         # Get the log ratios for the chosen and rejected responses, ensuring clean copies on the correct device
-        chosen_logratios = chosen_logps.clone().to(device) - (not self.reference_free) * ref_chosen_logps.clone().to(device)
-        rejected_logratios = rejected_logps.clone().to(device) - (not self.reference_free) * ref_rejected_logps.clone().to(device)
+        chosen_logratios = chosen_logps.clone().to(device) - (not self.reference_free) * ref_chosen_logps.clone().to(
+            device
+        )
+        rejected_logratios = rejected_logps.clone().to(device) - (
+            not self.reference_free
+        ) * ref_rejected_logps.clone().to(device)
 
         if self.f_divergence_type == FDivergenceType.ALPHA_DIVERGENCE.value:
             # The alpha-divergence formula: (1 - u^-alpha) / alpha
@@ -760,11 +764,18 @@ class DPOTrainer(Trainer):
             model_kwargs["output_router_logits"] = True
 
         # Concatenate the prompt and completion inputs
-        input_ids = torch.cat((concatenated_batch["prompt_input_ids"], concatenated_batch["completion_input_ids"]), dim=1)
-        attention_mask = torch.cat((concatenated_batch["prompt_attention_mask"], concatenated_batch["completion_attention_mask"]), dim=1)
+        input_ids = torch.cat(
+            (concatenated_batch["prompt_input_ids"], concatenated_batch["completion_input_ids"]), dim=1
+        )
+        attention_mask = torch.cat(
+            (concatenated_batch["prompt_attention_mask"], concatenated_batch["completion_attention_mask"]), dim=1
+        )
         # Mask the prompt but not the completion for the loss
         loss_mask = torch.cat(
-            (torch.zeros_like(concatenated_batch["prompt_attention_mask"]), concatenated_batch["completion_attention_mask"]),
+            (
+                torch.zeros_like(concatenated_batch["prompt_attention_mask"]),
+                concatenated_batch["completion_attention_mask"],
+            ),
             dim=1,
         )
 
