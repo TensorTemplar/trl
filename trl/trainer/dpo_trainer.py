@@ -47,6 +47,8 @@ from transformers.trainer_utils import EvalLoopOutput
 from transformers.utils import is_peft_available
 from transformers.utils.deprecation import deprecate_kwarg
 
+from trl import ModelConfig, ScriptArguments
+
 from ..data_utils import maybe_apply_chat_template, maybe_extract_prompt
 from .callbacks import SyncRefModelCallback
 from .dpo_config import DPOConfig, FDivergenceConstants, FDivergenceType
@@ -66,6 +68,12 @@ if is_peft_available():
 
 if is_wandb_available():
     import wandb
+
+
+@dataclass
+class DPOTrainingConfig(DPOConfig, ModelConfig, ScriptArguments):
+    """Configuration class that combines DPO, Model and Script arguments."""
+    pass
 
 
 @dataclass
@@ -162,8 +170,8 @@ class DPOTrainer(Trainer):
         self,
         model: Union[PreTrainedModel, nn.Module],
         train_dataset: Dataset,
+        args: DPOTrainingConfig,
         ref_model: Optional[Union[PreTrainedModel, nn.Module]] = None,
-        args: Optional[DPOConfig] = None,
         data_collator: Optional[DataCollator] = None,
         eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
         processing_class: Optional[
@@ -176,9 +184,6 @@ class DPOTrainer(Trainer):
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
         peft_config: Optional[dict] = None,
     ):
-        if model is None:
-            raise ValueError("No model provided. Please provide a model to train.")
-
         if ref_model is model:
             raise ValueError(
                 "`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the "
@@ -436,41 +441,25 @@ class DPOTrainer(Trainer):
             features (`dict[str, str]`):
                 Row of the dataset, should contain the keys `"prompt"`, `"chosen"`, and `"rejected"`.
             processing_class (`PreTrainedTokenizerBase`):
-                Processing class used to process the data.
+                Processing class used to tokenize the data.
             max_prompt_length (`int` or `None`):
                 Maximum length of the prompt sequence. If `None`, the prompt sequence is not truncated.
             max_completion_length (`int` or `None`):
                 Maximum length of the completion sequences. If `None`, the completion sequences are not truncated.
             add_special_tokens (`bool`):
-                Whether to add special tokens to the sequences. Typically used for encoder-decoder models. If `True`,
-                the prompt sequence will have a bos token prepended and an eos token appended. In any case, the
-                completion sequences will have an eos token appended.
+                Unused parameter kept for backward compatibility.
 
         Returns:
             `dict[str, list[int]]`:
                 Tokenized sequences with the keys `"prompt_input_ids"`, `"chosen_input_ids"`, and
-                `"rejected_input_ids".
-
-        Example:
-        ```python
-        >>> from transformers import GPT2Tokenizer
-        >>> tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
-        >>> features = {"prompt": "The sky is", "chosen": " blue", "rejected": " green"}
-        >>> DPOTrainer.tokenize_row(features, tokenizer, max_prompt_length=3, max_completion_length=3, add_special_tokens=False)
-        {'prompt_input_ids': [464, 6766, 318], 'chosen_input_ids': [4171, 50256], 'rejected_input_ids': [4077, 50256]}
-        ```
+                `"rejected_input_ids"`.
         """
         tokenizer = processing_class  # the processing class is a tokenizer
         prompt_input_ids = tokenizer(features["prompt"], add_special_tokens=False)["input_ids"]
         chosen_input_ids = tokenizer(features["chosen"], add_special_tokens=False)["input_ids"]
         rejected_input_ids = tokenizer(features["rejected"], add_special_tokens=False)["input_ids"]
 
-        # Add special tokens (typically for encoder-decoder models)
-        if add_special_tokens:
-            if tokenizer.bos_token_id is not None:
-                prompt_input_ids = [tokenizer.bos_token_id] + prompt_input_ids
-            if tokenizer.eos_token_id is not None:
-                prompt_input_ids = prompt_input_ids + [tokenizer.eos_token_id]
+        # Add EOS token to completions
         chosen_input_ids = chosen_input_ids + [tokenizer.eos_token_id]
         rejected_input_ids = rejected_input_ids + [tokenizer.eos_token_id]
 
