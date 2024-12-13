@@ -71,7 +71,6 @@ if is_wandb_available():
     import wandb
 
 
-
 @dataclass
 class PreferenceCollator(DataCollatorMixin):
     """
@@ -111,6 +110,34 @@ class PreferenceCollator(DataCollatorMixin):
 
     pad_token_id: int
     return_tensors: str = "pt"
+
+    def torch_call(self, examples: list[Union[list[int], Any, dict[str, Any]]]) -> dict[str, Any]:
+        # Convert lists to tensors
+        prompt_input_ids = [torch.tensor(example["prompt_input_ids"]) for example in examples]
+        prompt_attention_mask = [torch.ones_like(input_ids) for input_ids in prompt_input_ids]
+        chosen_input_ids = [torch.tensor(example["chosen_input_ids"]) for example in examples]
+        chosen_attention_mask = [torch.ones_like(input_ids) for input_ids in chosen_input_ids]
+        rejected_input_ids = [torch.tensor(example["rejected_input_ids"]) for example in examples]
+        rejected_attention_mask = [torch.ones_like(input_ids) for input_ids in rejected_input_ids]
+
+        if "ref_chosen_logps" in examples[0] and "ref_rejected_logps" in examples[0]:
+            ref_chosen_logps = torch.tensor([example["ref_chosen_logps"] for example in examples])
+            ref_rejected_logps = torch.tensor([example["ref_rejected_logps"] for example in examples])
+
+        # Pad
+        output = {}
+        output["prompt_input_ids"] = pad(prompt_input_ids, padding_value=self.pad_token_id, padding_side="left")
+        output["prompt_attention_mask"] = pad(prompt_attention_mask, padding_value=0, padding_side="left")
+        output["chosen_input_ids"] = pad(chosen_input_ids, padding_value=self.pad_token_id)
+        output["chosen_attention_mask"] = pad(chosen_attention_mask, padding_value=0)
+        output["rejected_input_ids"] = pad(rejected_input_ids, padding_value=self.pad_token_id)
+        output["rejected_attention_mask"] = pad(rejected_attention_mask, padding_value=0)
+
+        if "ref_chosen_logps" in examples[0] and "ref_rejected_logps" in examples[0]:
+            output["ref_chosen_logps"] = ref_chosen_logps
+            output["ref_rejected_logps"] = ref_rejected_logps
+
+        return output
 
 
 class DPOTrainer(Trainer):
@@ -519,14 +546,14 @@ class DPOTrainer(Trainer):
         """
         # Convert lists to tensors if needed
         prompt_mask = (
-            batch["prompt_attention_mask"] 
-            if torch.is_tensor(batch["prompt_attention_mask"]) 
+            batch["prompt_attention_mask"]
+            if torch.is_tensor(batch["prompt_attention_mask"])
             else torch.tensor(batch["prompt_attention_mask"])
         )
 
         prompt_ids = (
-            batch["prompt_input_ids"] 
-            if torch.is_tensor(batch["prompt_input_ids"]) 
+            batch["prompt_input_ids"]
+            if torch.is_tensor(batch["prompt_input_ids"])
             else torch.tensor(batch["prompt_input_ids"])
         )
 
