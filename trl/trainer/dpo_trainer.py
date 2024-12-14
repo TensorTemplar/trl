@@ -442,7 +442,7 @@ class DPOTrainer(Trainer):
                     "You currently cannot use `ref_model=None` with TR-DPO method. Please provide `ref_model`."
                 )
         else:
-            self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
+            self.ref_model = self.accelerator.prepare_model(self.ref_model, device_placement=True, evaluation_mode=True)
 
         if args.sync_ref_model:
             if self.precompute_ref_log_probs:
