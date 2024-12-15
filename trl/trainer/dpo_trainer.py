@@ -213,6 +213,26 @@ class DPOTrainer(Trainer):
                 "`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the "
                 "same as `model`, you must pass a copy of it."
             )
+        
+        # Handle TR-DPO case first
+        if args.sync_ref_model and ref_model is None:
+            raise ValueError(
+                "You currently cannot use `ref_model=None` with TR-DPO method. Please provide `ref_model`."
+            )
+
+        # Determine if we can use model as reference
+        can_use_model_as_ref = self.is_peft_model or args.precompute_ref_log_probs
+
+        # Set and prepare reference model
+        if ref_model is not None:
+            self.ref_model = self.accelerator.prepare_model(ref_model, device_placement=True, evaluation_mode=True)
+        elif can_use_model_as_ref:
+            self.ref_model = None  # Will use model with adapters off
+        else:
+            raise ValueError(
+                "No reference model provided and model cannot be used as reference. "
+                "Either provide a reference model or set `precompute_ref_log_probs=True`"
+            )
 
         if not is_peft_available() and peft_config is not None:
             raise ValueError(
@@ -280,13 +300,6 @@ class DPOTrainer(Trainer):
         self.ref_adapter_name = args.ref_adapter_name
         self.reference_free = args.reference_free
 
-        if ref_model:
-            self.ref_model = ref_model
-        elif self.is_peft_model or args.precompute_ref_log_probs:
-            # The `model` with adapters turned off will be used as the reference model
-            self.ref_model = None
-        else:
-            raise ValueError("No reference model provided.")
 
         if processing_class is None:
             raise ValueError("processing_class must be specified to tokenize a DPO dataset.")
@@ -431,18 +444,6 @@ class DPOTrainer(Trainer):
             raise AttributeError(
                 "Your `Trainer` does not have an `accelerator` object. Consider upgrading `transformers`."
             )
-
-        if self.ref_model is None:
-            if not (self.is_peft_model or self.precompute_ref_log_probs):
-                raise ValueError(
-                    "No reference model and model is not a Peft model. Try setting `precompute_ref_log_probs=True`"
-                )
-            if args.sync_ref_model:
-                raise ValueError(
-                    "You currently cannot use `ref_model=None` with TR-DPO method. Please provide `ref_model`."
-                )
-        else:
-            self.ref_model = self.accelerator.prepare_model(self.ref_model, device_placement=True, evaluation_mode=True)
 
         if args.sync_ref_model:
             if self.precompute_ref_log_probs:
