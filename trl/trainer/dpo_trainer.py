@@ -278,6 +278,9 @@ class DPOTrainer(Trainer):
         self.precompute_ref_log_probs = args.precompute_ref_log_probs
         self.use_num_logits_to_keep = args.use_num_logits_to_keep
 
+        self._precomputed_train_ref_log_probs = False
+        self._precomputed_eval_ref_log_probs = False
+
         if (
             args.loss_type in ["hinge", "ipo", "bco_pair", "sppo_hard", "nca_pair", "apo_zero", "apo_down"]
             and args.label_smoothing > 0
@@ -400,7 +403,9 @@ class DPOTrainer(Trainer):
                 self.ref_model = None  # we will use policy model with adapters disabled as reference model
 
         else:
-            self.ref_model = self.accelerator.prepare_model(self.ref_model, device_placement=True, evaluation_mode=True)
+            self.ref_model = self.accelerator.prepare_model(
+                self.ref_model, device_placement=True, evaluation_mode=True
+            )
 
         self._peft_has_been_casted_to_bf16 = False
         if peft_config is not None:
@@ -505,20 +510,111 @@ class DPOTrainer(Trainer):
             "rejected_input_ids": rejected_input_ids,
         }
 
+    def get_train_dataloader(self) -> DataLoader:
+        """
+        Returns the training [`~torch.utils.data.DataLoader`].
+        Subclass of transformers.src.transformers.trainer.get_train_dataloader to precompute `ref_log_probs`.
+        """
+
+        if self.precompute_ref_log_probs and not self._precomputed_train_ref_log_probs:
+            batch_size = self.args.precompute_ref_batch_size or self.args.per_device_train_batch_size
+            dataloader_params = {
+                "batch_size": batch_size,
+                "collate_fn": self.data_collator,
+                "num_workers": self.args.dataloader_num_workers,
+                "pin_memory": self.args.dataloader_pin_memory,
+                "shuffle": False,
+            }
+
+            # prepare dataloader
+            data_loader = self.accelerator.prepare(DataLoader(self.train_dataset, **dataloader_params))
+
+            ref_chosen_logps = []
+            ref_rejected_logps = []
+            for padded_batch in tqdm(iterable=data_loader, desc="Train dataset reference log probs"):
+                ref_chosen_logp, ref_rejected_logp = self.compute_ref_log_probs(padded_batch)
+                ref_chosen_logp, ref_rejected_logp = self.accelerator.gather_for_metrics(
+                    (ref_chosen_logp, ref_rejected_logp)
+                )
+                ref_chosen_logps.append(ref_chosen_logp.cpu())
+                ref_rejected_logps.append(ref_rejected_logp.cpu())
+
+                # Unnecessary cache clearing to avoid OOM
+                torch.cuda.empty_cache()
+                self.accelerator.free_memory()
+
+            all_ref_chosen_logps = torch.cat(ref_chosen_logps).float().numpy()
+            all_ref_rejected_logps = torch.cat(ref_rejected_logps).float().numpy()
+
+            self.train_dataset = self.train_dataset.add_column(name="ref_chosen_logps", column=all_ref_chosen_logps)
+            self.train_dataset = self.train_dataset.add_column(
+                name="ref_rejected_logps", column=all_ref_rejected_logps
+            )
+
+            self._precomputed_train_ref_log_probs = True
+
+        return super().get_train_dataloader()
+
+    def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
+        """
+        Returns the evaluation [`~torch.utils.data.DataLoader`].
+        Subclass of transformers.src.transformers.trainer.get_eval_dataloader to precompute `ref_log_probs`.
+        Args:
+            eval_dataset (`torch.utils.data.Dataset`, *optional*):
+                If provided, will override `self.eval_dataset`. If it is a [`~datasets.Dataset`], columns not accepted
+                by the `model.forward()` method are automatically removed. It must implement `__len__`.
+        """
+        if eval_dataset is None and self.eval_dataset is None:
+            raise ValueError("Trainer: evaluation requires an eval_dataset.")
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+
+        if self.precompute_ref_log_probs and not self._precomputed_eval_ref_log_probs:
+            batch_size = self.args.precompute_ref_batch_size or self.args.per_device_eval_batch_size
+            dataloader_params = {
+                "batch_size": batch_size,
+                "collate_fn": self.data_collator,
+                "num_workers": self.args.dataloader_num_workers,
+                "pin_memory": self.args.dataloader_pin_memory,
+                "shuffle": False,
+            }
+
+            # prepare dataloader
+            data_loader = self.accelerator.prepare(DataLoader(eval_dataset, **dataloader_params))
+
+            ref_chosen_logps = []
+            ref_rejected_logps = []
+            for padded_batch in tqdm(iterable=data_loader, desc="Eval dataset reference log probs"):
+                ref_chosen_logp, ref_rejected_logp = self.compute_ref_log_probs(padded_batch)
+                ref_chosen_logp, ref_rejected_logp = self.accelerator.gather_for_metrics(
+                    (ref_chosen_logp, ref_rejected_logp)
+                )
+                ref_chosen_logps.append(ref_chosen_logp.cpu())
+                ref_rejected_logps.append(ref_rejected_logp.cpu())
+
+            all_ref_chosen_logps = torch.cat(ref_chosen_logps).float().numpy()
+            all_ref_rejected_logps = torch.cat(ref_rejected_logps).float().numpy()
+
+            eval_dataset = eval_dataset.add_column(name="ref_chosen_logps", column=all_ref_chosen_logps)
+            eval_dataset = eval_dataset.add_column(name="ref_rejected_logps", column=all_ref_rejected_logps)
+
+            # Save calculated ref_chosen_logps and ref_rejected_logps to the eval_dataset for subsequent runs
+            if self.eval_dataset is not None:
+                self.eval_dataset = eval_dataset
+            self._precomputed_eval_ref_log_probs = True
+
+        return super().get_eval_dataloader(eval_dataset=eval_dataset)
+
     @contextmanager
     def reference_model_context(self):
-        """Context manager for using the policy model as a reference model."""
-        if hasattr(self.model, "disable_adapter"):  # Only do anything if it's a PEFT model
-            if not self.ref_adapter_name:
-                with self.accelerator.unwrap_model(self.model).disable_adapter():
-                    yield
-            else:
-                original_adapter = self.model.active_adapter
+        """Context manager for handling null reference model (that is, peft adapter manipulation)."""
+        with self.accelerator.unwrap_model(self.model).disable_adapter() if hasattr(
+            self.model, "disable_adapter"
+        ) and not self.ref_adapter_name else nullcontext():
+            if self.ref_adapter_name:
                 self.model.set_adapter(self.ref_adapter_name)
-                yield
-                self.model.set_adapter(original_adapter)
-        else:
-            yield  # Do nothing for non-PEFT models
+            yield
+            if self.ref_adapter_name:
+                self.model.set_adapter(self.model_adapter_name or "default")
 
     def compute_ref_log_probs(self, batch: dict[str, torch.LongTensor]) -> dict:
         """Computes log probabilities of the reference model for a single padded batch of a DPO specific dataset."""
