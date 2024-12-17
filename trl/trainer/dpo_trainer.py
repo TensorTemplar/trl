@@ -527,7 +527,7 @@ class DPOTrainer(Trainer):
             if self.is_deepspeed_enabled:
                 self.ref_model = self._prepare_deepspeed(self.ref_model)
             else:
-                self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
+                self.ref_model = self.accelerator.prepare_model(self.ref_model, device_placement=True, evaluation_mode=True)
 
         if args.sync_ref_model:
             if self.precompute_ref_log_probs:
