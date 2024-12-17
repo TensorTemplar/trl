@@ -697,7 +697,11 @@ class DPOTrainer(Trainer):
         if self.precompute_ref_log_probs and not self._precomputed_train_ref_log_probs:
 
             def compute_ref_log_probs_for_batch(examples):
-                batch = self.data_collator(examples)
+                # Transform examples (dict of lists) to a list of dicts
+                batch_examples = [
+                    {k: v[i] for k, v in examples.items()} for i in range(len(next(iter(examples.values()))))
+                ]
+                batch = self.data_collator(batch_examples)
                 batch = {k: v.to(self.accelerator.device) if torch.is_tensor(v) else v for k, v in batch.items()}
                 ref_chosen_logp, ref_rejected_logp = self.compute_ref_log_probs(batch)
                 return {
@@ -710,7 +714,6 @@ class DPOTrainer(Trainer):
                     compute_ref_log_probs_for_batch,
                     batched=True,
                     batch_size=self.args.precompute_ref_batch_size or self.args.per_device_train_batch_size,
-                    num_proc=self.args.dataloader_num_workers,
                     desc="Computing reference log probs for the training dataset",
                     load_from_cache_file=False,  # Ensure all processes compute the data
                 )
