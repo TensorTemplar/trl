@@ -208,39 +208,61 @@ class DPOTrainer(Trainer):
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
         peft_config: Optional[dict] = None,
     ):
+        # Check *almost* all dependencies and conditionals before doing any expensive processing
         if ref_model is model:
             raise ValueError(
                 "`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the "
                 "same as `model`, you must pass a copy of it."
             )
         
-        # Handle TR-DPO case first
-        if args.sync_ref_model and ref_model is None:
+        if processing_class is None:
+            raise ValueError("processing_class must be specified to tokenize a DPO dataset.")
+        
+        if args.loss_type == "kto_pair":
+            raise ValueError("Support for kto_pair has been removed in DPOTrainer. Please use KTOTrainer.")
+
+        if args.generate_during_eval and not is_wandb_available():
             raise ValueError(
-                "You currently cannot use `ref_model=None` with TR-DPO method. Please provide `ref_model`."
+                "`generate_during_eval=True` requires Weights and Biases to be installed."
+                " Please install `wandb` to resolve."
             )
+        
+        # Handle TR-DPO case dependencies
+        if args.sync_ref_model:
+            if ref_model is None:
+                raise ValueError(
+                    "You currently cannot use `ref_model=None` with TR-DPO method. Please provide `ref_model`."
+                )
+            elif self.precompute_ref_log_probs:
+                raise ValueError(
+                    "You cannot use `precompute_ref_log_probs=True` with TR-DPO method. Please set `precompute_ref_log_probs=False`."
+                )
 
-        # Determine if we can use model as reference
-        can_use_model_as_ref = self.is_peft_model or args.precompute_ref_log_probs
+        if peft_config:
+            if not is_peft_available():
+                raise ValueError(
+                    "a PeftConfig was passed but we cannot find a `peft` package installed"
+                )
+            else:
+                self.peft_is_available = True
+            
+        # Determine if we can use model without adapters as reference
+        if ref_model is None and self.peft_is_available is False:
+            if not args.precompute_ref_log_probs:
+                raise ValueError(
+                    "No reference model provided and model cannot be used as reference, neither is peft available "
+                    "Either provide a reference model or set `precompute_ref_log_probs=True`"
+                )
+        elif self.peft_is_available:
+            if isinstance(model, PeftModel):
+                self.ref_model = None  # we will use policy model with adapters disabled as reference model
 
-        # Set and prepare reference model
-        if ref_model is not None:
-            self.ref_model = self.accelerator.prepare_model(ref_model, device_placement=True, evaluation_mode=True)
-        elif can_use_model_as_ref:
-            self.ref_model = None  # Will use model with adapters off
         else:
-            raise ValueError(
-                "No reference model provided and model cannot be used as reference. "
-                "Either provide a reference model or set `precompute_ref_log_probs=True`"
-            )
+            self.ref_model = self.accelerator.prepare_model(ref_model, device_placement=True, evaluation_mode=True)
 
-        if not is_peft_available() and peft_config is not None:
-            raise ValueError(
-                "PEFT is not installed and you passed a `peft_config` in the trainer's kwargs, please install it to use the PEFT models"
-            )
 
         self._peft_has_been_casted_to_bf16 = False
-        if is_peft_available() and peft_config is not None:
+        if peft_config is not None:
             # if model is a peft model and we have a peft_config, we merge and unload it first
             if isinstance(model, PeftModel):
                 model = model.merge_and_unload()
@@ -289,20 +311,9 @@ class DPOTrainer(Trainer):
             else:
                 model.get_input_embeddings().register_forward_hook(self._make_inputs_require_grad)
 
-        if args.generate_during_eval and not is_wandb_available():
-            raise ValueError(
-                "`generate_during_eval=True` requires Weights and Biases to be installed."
-                " Please install `wandb` to resolve."
-            )
-
-        self.is_peft_model = is_peft_available() and isinstance(model, PeftModel)
         self.model_adapter_name = args.model_adapter_name
         self.ref_adapter_name = args.ref_adapter_name
         self.reference_free = args.reference_free
-
-
-        if processing_class is None:
-            raise ValueError("processing_class must be specified to tokenize a DPO dataset.")
 
         if args.padding_value is not None:
             self.padding_value = args.padding_value
@@ -344,8 +355,6 @@ class DPOTrainer(Trainer):
                 "`label_smoothing` parameter will be ignored. Set `label_smoothing` to `0.0` to remove this warning.",
                 UserWarning,
             )
-        if args.loss_type == "kto_pair":
-            raise ValueError("Support for kto_pair has been removed in DPOTrainer. Please use KTOTrainer.")
 
         self.beta = args.beta
         self.label_smoothing = args.label_smoothing
@@ -440,17 +449,12 @@ class DPOTrainer(Trainer):
         if hasattr(self.model, "add_model_tags"):
             self.model.add_model_tags(self._tag_names)
 
-        if not hasattr(self, "accelerator"):
+        if not hasattr(self, "accelerator"):  # TODO: check dependency and consider moving this check in front of model loading in the sequence, to avoid late failures
             raise AttributeError(
                 "Your `Trainer` does not have an `accelerator` object. Consider upgrading `transformers`."
             )
 
         if args.sync_ref_model:
-            if self.precompute_ref_log_probs:
-                raise ValueError(
-                    "You cannot use `precompute_ref_log_probs=True` with TR-DPO method. Please set `precompute_ref_log_probs=False`."
-                )
-
             self.add_callback(SyncRefModelCallback(ref_model=self.ref_model, accelerator=self.accelerator))
 
         if self.loss_type == "bco_pair":
@@ -501,16 +505,22 @@ class DPOTrainer(Trainer):
         }
 
     @contextmanager
-    def null_ref_context(self):
-        """Context manager for handling null reference model (that is, peft adapter manipulation)."""
-        with self.accelerator.unwrap_model(
-            self.model
-        ).disable_adapter() if self.is_peft_model and not self.ref_adapter_name else nullcontext():
-            if self.ref_adapter_name:
-                self.model.set_adapter(self.ref_adapter_name)
+    def reference_model_context(self):
+        """Context manager for using the policy model as a reference model, by disabling or swapping adapters"""
+        if not self.ref_adapter_name:
+            # Case 1: No reference adapter - disable all adapters
+            model = self.accelerator.unwrap_model(self.model)
+            if hasattr(model, "disable_adapter"):  # Check if PEFT model, without implicitly assuming peft is available
+                with model.disable_adapter():
+                    yield
+            else:
+                yield
+        else:
+            # Case 2: Use specific reference adapter
+            original_adapter = self.model.active_adapter
+            self.model.set_adapter(self.ref_adapter_name)
             yield
-            if self.ref_adapter_name:
-                self.model.set_adapter(self.model_adapter_name or "default")
+            self.model.set_adapter(original_adapter)
 
     def compute_ref_log_probs(self, batch: dict[str, torch.LongTensor]) -> dict:
         """Computes log probabilities of the reference model for a single padded batch of a DPO specific dataset."""
@@ -518,7 +528,7 @@ class DPOTrainer(Trainer):
         compte_ref_context_manager = amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
         with torch.no_grad(), compte_ref_context_manager:
             if self.ref_model is None:
-                with self.null_ref_context():
+                with self.reference_model_context():
                     ref_model_output = self.concatenated_forward(self.model, batch)
             else:
                 ref_model_output = self.concatenated_forward(self.ref_model, batch)
@@ -986,7 +996,7 @@ class DPOTrainer(Trainer):
                 ref_output = batch["ref_output"]
             else:
                 if self.ref_model is None:
-                    with self.null_ref_context():
+                    with self.reference_model_context():
                         ref_output = self.model.generate(
                             input_ids=batch["prompt_input_ids"],
                             attention_mask=batch["prompt_attention_mask"],
