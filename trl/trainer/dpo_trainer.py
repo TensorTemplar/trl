@@ -58,8 +58,8 @@ from .utils import (
     cap_exp,
     disable_dropout_in_model,
     generate_model_card,
-    pad_to_length,
     pad,
+    pad_to_length,
     peft_module_casting_to_bf16,
 )
 
@@ -218,6 +218,7 @@ class DPOTrainer(Trainer):
 
         if processing_class is None:
             raise ValueError("processing_class must be specified to tokenize a DPO dataset.")
+        self.processing_class = processing_class
 
         if args.loss_type == "kto_pair":
             raise ValueError("Support for kto_pair has been removed in DPOTrainer. Please use KTOTrainer.")
@@ -446,10 +447,10 @@ class DPOTrainer(Trainer):
         # fail or completely fail.
         elif getattr(args, "gradient_checkpointing", False):
             # For backward compatibility with older versions of transformers
-            if hasattr(model, "enable_input_require_grads"):
-                model.enable_input_require_grads()
+            if hasattr(self.model, "enable_input_require_grads"):
+                self.model.enable_input_require_grads()
             else:
-                model.get_input_embeddings().register_forward_hook(self._make_inputs_require_grad)
+                self.model.get_input_embeddings().register_forward_hook(self._make_inputs_require_grad)
 
         self.model_adapter_name = args.model_adapter_name
         self.ref_adapter_name = args.ref_adapter_name
@@ -509,9 +510,9 @@ class DPOTrainer(Trainer):
         """Context manager for using the policy model as a reference model, by disabling or swapping adapters"""
         if not self.ref_adapter_name:
             # Case 1: No reference adapter - disable all adapters
-            model = self.accelerator.unwrap_model(self.model)
-            if hasattr(model, "disable_adapter"):  # Check if PEFT model, without implicitly assuming peft is available
-                with model.disable_adapter():
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            if hasattr(unwrapped_model, "disable_adapter"):  # Check if PEFT model, without implicitly assuming peft is available
+                with unwrapped_model.disable_adapter():
                     yield
             else:
                 yield
@@ -975,7 +976,7 @@ class DPOTrainer(Trainer):
 
         return loss
 
-    def generate_from_model_and_ref(self, model, batch: dict[str, torch.LongTensor]) -> tuple[str, str]:
+    def generate_from_model_and_ref(self, batch: dict[str, torch.LongTensor]) -> tuple[str, str]:
         """Generate samples from the model and reference model for the given batch of inputs."""
 
         # If one uses `generate_during_eval` with peft + bf16, we need to explicitly call generate with
@@ -983,7 +984,7 @@ class DPOTrainer(Trainer):
         generate_context_manager = amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
 
         with generate_context_manager:
-            policy_output = model.generate(
+            policy_output = self.model.generate(
                 input_ids=batch["prompt_input_ids"],
                 attention_mask=batch["prompt_attention_mask"],
                 max_length=self.max_length,
