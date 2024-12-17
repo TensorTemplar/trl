@@ -694,29 +694,46 @@ class DPOTrainer(Trainer):
             ]
 
     def get_train_dataloader(self) -> DataLoader:
+        """
+        Returns the training [`~torch.utils.data.DataLoader`].
+
+        Subclass of transformers.src.transformers.trainer.get_train_dataloader to precompute `ref_log_probs`.
+        """
+
         if self.precompute_ref_log_probs and not self._precomputed_train_ref_log_probs:
+            batch_size = self.args.precompute_ref_batch_size or self.args.per_device_train_batch_size
+            dataloader_params = {
+                "batch_size": batch_size,
+                "collate_fn": self.data_collator,
+                "num_workers": self.args.dataloader_num_workers,
+                "pin_memory": self.args.dataloader_pin_memory,
+                "shuffle": False,
+            }
 
-            def compute_ref_log_probs_for_batch(examples):
-                # Transform examples (dict of lists) to a list of dicts
-                batch_examples = [
-                    {k: v[i] for k, v in examples.items()} for i in range(len(next(iter(examples.values()))))
-                ]
-                batch = self.data_collator(batch_examples)
-                batch = {k: v.to(self.accelerator.device) if torch.is_tensor(v) else v for k, v in batch.items()}
-                ref_chosen_logp, ref_rejected_logp = self.compute_ref_log_probs(batch)
-                return {
-                    "ref_chosen_logps": ref_chosen_logp.detach().cpu().numpy(),
-                    "ref_rejected_logps": ref_rejected_logp.detach().cpu().numpy(),
-                }
+            # prepare dataloader
+            data_loader = self.accelerator.prepare(DataLoader(self.train_dataset, **dataloader_params))
 
-            with self.accelerator.main_process_first():
-                self.train_dataset = self.train_dataset.map(
-                    compute_ref_log_probs_for_batch,
-                    batched=True,
-                    batch_size=self.args.precompute_ref_batch_size or self.args.per_device_train_batch_size,
-                    desc="Computing reference log probs for the training dataset",
-                    load_from_cache_file=False,  # Ensure all processes compute the data
+            ref_chosen_logps = []
+            ref_rejected_logps = []
+            for padded_batch in tqdm(iterable=data_loader, desc="Train dataset reference log probs"):
+                ref_chosen_logp, ref_rejected_logp = self.compute_ref_log_probs(padded_batch)
+                ref_chosen_logp, ref_rejected_logp = self.accelerator.gather_for_metrics(
+                    (ref_chosen_logp, ref_rejected_logp)
                 )
+                ref_chosen_logps.append(ref_chosen_logp.cpu())
+                ref_rejected_logps.append(ref_rejected_logp.cpu())
+
+                # Unnecessary cache clearing to avoid OOM
+                torch.cuda.empty_cache()
+                self.accelerator.free_memory()
+
+            all_ref_chosen_logps = torch.cat(ref_chosen_logps).float().numpy()
+            all_ref_rejected_logps = torch.cat(ref_rejected_logps).float().numpy()
+
+            self.train_dataset = self.train_dataset.add_column(name="ref_chosen_logps", column=all_ref_chosen_logps)
+            self.train_dataset = self.train_dataset.add_column(
+                name="ref_rejected_logps", column=all_ref_rejected_logps
+            )
 
             self._precomputed_train_ref_log_probs = True
 
