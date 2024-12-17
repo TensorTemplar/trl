@@ -354,7 +354,7 @@ class DPOTrainer(Trainer):
             # The `model` with adapters turned off will be used as the reference model
             self.ref_model = None
         else:
-            self.ref_model = create_reference_model(model)
+            self.ref_model = create_reference_model(model=model, set_eval=False)  # device placement handled by accelerator
 
         if processing_class is None:
             raise ValueError("processing_class must be specified to tokenize a DPO dataset.")

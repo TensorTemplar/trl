@@ -604,7 +604,7 @@ class PreTrainedModelWrapper(nn.Module):
 
 
 def create_reference_model(
-    model: PreTrainedModelWrapper, num_shared_layers: Optional[int] = None, pattern: Optional[str] = None
+    model: PreTrainedModelWrapper, num_shared_layers: Optional[int] = None, pattern: Optional[str] = None, set_eval: bool = True
 ) -> PreTrainedModelWrapper:
     """
     Creates a static reference copy of a model. Note that model will be in `.eval()` mode.
@@ -674,7 +674,9 @@ def create_reference_model(
     if pattern is not None and len(unshared_param_list) == 0:
         logging.warning("Pattern passed or found, but no layers matched in the model. Check for a typo.")
 
-    return ref_model.eval()
+    if set_eval:
+        ref_model.eval()
+    return ref_model
 
 
 class GeometricMixtureWrapper(GenerationMixin):
