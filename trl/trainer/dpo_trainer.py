@@ -223,17 +223,6 @@ class DPOTrainer(Trainer):
         # Determine if we can use policy model as reference
         can_use_model_as_ref = hasattr(model, "disable_adapter") or args.precompute_ref_log_probs
 
-        # Set and prepare reference model
-        if ref_model is not None:
-            self.ref_model = self.accelerator.prepare_model(ref_model, device_placement=True, evaluation_mode=True)
-        elif can_use_model_as_ref:
-            self.ref_model = None  # Will use model with adapters off
-        else:
-            raise ValueError(
-                "No reference model provided and model cannot be used as reference. "
-                "Either provide a reference model or set `precompute_ref_log_probs=True`"
-            )
-
         if not is_peft_available() and peft_config is not None:
             raise ValueError(
                 "PEFT is not installed and you passed a `peft_config` in the trainer's kwargs, please install it to use the PEFT models"
@@ -323,8 +312,6 @@ class DPOTrainer(Trainer):
 
         if args.disable_dropout:
             disable_dropout_in_model(model)
-            if self.ref_model is not None:
-                disable_dropout_in_model(self.ref_model)
 
         self.max_length = args.max_length
         self.generate_during_eval = args.generate_during_eval
@@ -444,6 +431,20 @@ class DPOTrainer(Trainer):
             raise AttributeError(
                 "Your `Trainer` does not have an `accelerator` object. Consider upgrading `transformers`."
             )
+
+        # Set and prepare reference model
+        if ref_model is not None:
+            self.ref_model = self.accelerator.prepare_model(ref_model, device_placement=True, evaluation_mode=True)
+        elif can_use_model_as_ref:
+            self.ref_model = None  # Will use model with adapters off
+        else:
+            raise ValueError(
+                "No reference model provided and model cannot be used as reference. "
+                "Either provide a reference model or set `precompute_ref_log_probs=True`"
+            )
+
+        if self.ref_model is not None and args.disable_dropout:
+            disable_dropout_in_model(self.ref_model)
 
         if args.sync_ref_model:
             if self.precompute_ref_log_probs:
