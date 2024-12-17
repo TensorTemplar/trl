@@ -507,21 +507,18 @@ class DPOTrainer(Trainer):
 
     @contextmanager
     def reference_model_context(self):
-        """Context manager for using the policy model as a reference model, by disabling or swapping adapters"""
-        if not self.ref_adapter_name:
-            # Case 1: No reference adapter - disable all adapters
-            unwrapped_model = self.accelerator.unwrap_model(self.model)
-            if hasattr(unwrapped_model, "disable_adapter"):  # Check if PEFT model, without implicitly assuming peft is available
-                with unwrapped_model.disable_adapter():
+        """Context manager for using the policy model as a reference model."""
+        if hasattr(self.model, "disable_adapter"):  # Only do anything if it's a PEFT model
+            if not self.ref_adapter_name:
+                with self.accelerator.unwrap_model(self.model).disable_adapter():
                     yield
             else:
+                original_adapter = self.model.active_adapter
+                self.model.set_adapter(self.ref_adapter_name)
                 yield
+                self.model.set_adapter(original_adapter)
         else:
-            # Case 2: Use specific reference adapter
-            original_adapter = self.model.active_adapter
-            self.model.set_adapter(self.ref_adapter_name)
-            yield
-            self.model.set_adapter(original_adapter)
+            yield  # Do nothing for non-PEFT models
 
     def compute_ref_log_probs(self, batch: dict[str, torch.LongTensor]) -> dict:
         """Computes log probabilities of the reference model for a single padded batch of a DPO specific dataset."""
