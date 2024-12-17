@@ -238,6 +238,7 @@ class DPOTrainer(Trainer):
                     "You cannot use `precompute_ref_log_probs=True` with TR-DPO method. Please set `precompute_ref_log_probs=False`."
                 )
 
+        self.peft_is_available = False
         if peft_config:
             if not is_peft_available():
                 raise ValueError(
