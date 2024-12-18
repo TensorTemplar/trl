@@ -878,6 +878,165 @@ class DPOTrainer(Trainer):
 
         return losses, chosen_rewards, rejected_rewards
 
+    def forward(
+        self,
+        model: nn.Module,
+        prompt_input_ids: torch.LongTensor,
+        prompt_attention_mask: torch.LongTensor,
+        completion_input_ids: torch.LongTensor,
+        completion_attention_mask: torch.LongTensor,
+    ) -> torch.FloatTensor:
+        """Regular forward pass that maintains the prompt/completion separation."""
+
+        # Concatenate prompt and completion
+        input_ids = torch.cat((prompt_input_ids, completion_input_ids), dim=1)
+        attention_mask = torch.cat((prompt_attention_mask, completion_attention_mask), dim=1)
+
+        # Create loss mask that zeros out prompt portion
+        loss_mask = torch.cat(
+            (
+                torch.zeros_like(prompt_attention_mask),
+                completion_attention_mask,
+            ),
+            dim=1,
+        )
+
+        # Flush left like in original implementation
+        for i in range(attention_mask.size(0)):
+            first_one_idx = torch.nonzero(attention_mask[i])[0].item()
+            input_ids[i] = torch.roll(input_ids[i], shifts=-first_one_idx)
+            attention_mask[i] = torch.roll(attention_mask[i], shifts=-first_one_idx)
+            loss_mask[i] = torch.roll(loss_mask[i], shifts=-first_one_idx)
+
+        # Remove empty columns (optimization from original)
+        empty_cols = torch.sum(attention_mask, dim=0) == 0
+        if empty_cols.any():
+            first_empty_col = torch.nonzero(empty_cols)[0].item()
+            input_ids = input_ids[:, :first_empty_col]
+            attention_mask = attention_mask[:, :first_empty_col]
+            loss_mask = loss_mask[:, :first_empty_col]
+
+        # Apply max length truncation if specified
+        if self.args.max_length is not None:
+            input_ids = input_ids[:, : self.args.max_length]
+            attention_mask = attention_mask[:, : self.args.max_length]
+            loss_mask = loss_mask[:, : self.args.max_length]
+
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+
+        # Get logits and compute log probabilities
+        logits = outputs.logits[:, :-1, :]
+        labels = input_ids[:, 1:].clone()
+        loss_mask = loss_mask[:, 1:].bool()
+
+        # Zero out padding in labels where loss_mask is False
+        labels[~loss_mask] = 0
+
+        per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+
+        # Apply loss mask
+        per_token_logps = per_token_logps * loss_mask
+
+        # Handle num_logits_to_keep if enabled
+        if self.use_num_logits_to_keep:
+            first_compute_index = loss_mask.nonzero(as_tuple=True)[1].min()
+            num_logits_to_keep = loss_mask.shape[1] - first_compute_index
+            per_token_logps = per_token_logps[:, -num_logits_to_keep:]
+            loss_mask = loss_mask[:, -num_logits_to_keep:]
+
+        return per_token_logps.sum(dim=-1)
+
+    def get_batch_loss_metrics(
+        self,
+        model: Union[PreTrainedModel, nn.Module],
+        batch: dict[str, torch.LongTensor],
+        train_eval: Literal["train", "eval"] = "train",
+    ) -> tuple[torch.FloatTensor, dict[str, torch.FloatTensor]]:
+        """Compute the DPO loss and metrics for a batch using separate forward passes."""
+
+        metrics = {}
+
+        # Forward passes for policy model
+        chosen_logps = self.forward(
+            model,
+            prompt_input_ids=batch["prompt_input_ids"],
+            prompt_attention_mask=batch["prompt_attention_mask"],
+            completion_input_ids=batch["chosen_input_ids"],
+            completion_attention_mask=batch["chosen_attention_mask"],
+        )
+
+        rejected_logps = self.forward(
+            model,
+            prompt_input_ids=batch["prompt_input_ids"],
+            prompt_attention_mask=batch["prompt_attention_mask"],
+            completion_input_ids=batch["rejected_input_ids"],
+            completion_attention_mask=batch["rejected_attention_mask"],
+        )
+
+        # Get reference model outputs
+        if "ref_chosen_logps" in batch and "ref_rejected_logps" in batch:
+            ref_chosen_logps = batch["ref_chosen_logps"]
+            ref_rejected_logps = batch["ref_rejected_logps"]
+        else:
+            with torch.no_grad():
+                if self.ref_model is None:
+                    with self.reference_model_context():
+                        ref_chosen_logps = self.forward(
+                            model,
+                            prompt_input_ids=batch["prompt_input_ids"],
+                            prompt_attention_mask=batch["prompt_attention_mask"],
+                            completion_input_ids=batch["chosen_input_ids"],
+                            completion_attention_mask=batch["chosen_attention_mask"],
+                        )
+                        ref_rejected_logps = self.forward(
+                            model,
+                            prompt_input_ids=batch["prompt_input_ids"],
+                            prompt_attention_mask=batch["prompt_attention_mask"],
+                            completion_input_ids=batch["rejected_input_ids"],
+                            completion_attention_mask=batch["rejected_attention_mask"],
+                        )
+                else:
+                    ref_chosen_logps = self.forward(
+                        self.ref_model,
+                        prompt_input_ids=batch["prompt_input_ids"],
+                        prompt_attention_mask=batch["prompt_attention_mask"],
+                        completion_input_ids=batch["chosen_input_ids"],
+                        completion_attention_mask=batch["chosen_attention_mask"],
+                    )
+                    ref_rejected_logps = self.forward(
+                        self.ref_model,
+                        prompt_input_ids=batch["prompt_input_ids"],
+                        prompt_attention_mask=batch["prompt_attention_mask"],
+                        completion_input_ids=batch["rejected_input_ids"],
+                        completion_attention_mask=batch["rejected_attention_mask"],
+                    )
+
+        # Compute losses and metrics
+        losses, chosen_rewards, rejected_rewards = self.dpo_loss(
+            chosen_logps,
+            rejected_logps,
+            ref_chosen_logps,
+            ref_rejected_logps,
+        )
+
+        # Record metrics
+        prefix = "eval_" if train_eval == "eval" else ""
+        metrics.update(
+            {
+                f"{prefix}rewards/chosen": chosen_rewards.mean(),
+                f"{prefix}rewards/rejected": rejected_rewards.mean(),
+                f"{prefix}rewards/accuracies": (chosen_rewards > rejected_rewards).float().mean(),
+                f"{prefix}rewards/margins": (chosen_rewards - rejected_rewards).mean(),
+                f"{prefix}logps/chosen": chosen_logps.mean(),
+                f"{prefix}logps/rejected": rejected_logps.mean(),
+            }
+        )
+
+        return losses.mean(), metrics
+
     def concatenated_forward(self, model: nn.Module, batch: dict[str, Union[list, torch.LongTensor]]):
         """Run the given model on the given batch of inputs, concatenating the chosen and rejected inputs together.
 
@@ -1000,7 +1159,7 @@ class DPOTrainer(Trainer):
 
         return output
 
-    def get_batch_loss_metrics(
+    def get_batch_loss_metrics_concatenated(
         self,
         model,
         batch: dict[str, Union[list, torch.LongTensor]],
