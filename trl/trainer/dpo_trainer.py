@@ -618,23 +618,22 @@ class DPOTrainer(Trainer):
             if self.ref_adapter_name:
                 self.model.set_adapter(self.model_adapter_name or "default")
 
-
-    def compute_ref_log_probs(self, batch: dict[str, torch.LongTensor]) -> tuple[torch.FloatTensor, torch.FloatTensor]:
-        """Computes log probabilities of the reference model for a single batch."""
+    def compute_ref_log_probs(self, batch: dict[str, torch.LongTensor]) -> dict:
+        """Computes log probabilities and logits of the reference model for a single batch."""
 
         compute_ref_context_manager = amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
 
         with torch.no_grad(), compute_ref_context_manager:
             if self.ref_model is None:
                 with self.reference_model_context():
-                    ref_chosen_logps = self.forward(
+                    ref_chosen_logps, ref_chosen_logits = self.forward(
                         self.model,
                         prompt_input_ids=batch["prompt_input_ids"],
                         prompt_attention_mask=batch["prompt_attention_mask"],
                         completion_input_ids=batch["chosen_input_ids"],
                         completion_attention_mask=batch["chosen_attention_mask"],
                     )
-                    ref_rejected_logps = self.forward(
+                    ref_rejected_logps, ref_rejected_logits = self.forward(
                         self.model,
                         prompt_input_ids=batch["prompt_input_ids"],
                         prompt_attention_mask=batch["prompt_attention_mask"],
@@ -642,14 +641,14 @@ class DPOTrainer(Trainer):
                         completion_attention_mask=batch["rejected_attention_mask"],
                     )
             else:
-                ref_chosen_logps = self.forward(
+                ref_chosen_logps, ref_chosen_logits = self.forward(
                     self.ref_model,
                     prompt_input_ids=batch["prompt_input_ids"],
                     prompt_attention_mask=batch["prompt_attention_mask"],
                     completion_input_ids=batch["chosen_input_ids"],
                     completion_attention_mask=batch["chosen_attention_mask"],
                 )
-                ref_rejected_logps = self.forward(
+                ref_rejected_logps, ref_rejected_logits = self.forward(
                     self.ref_model,
                     prompt_input_ids=batch["prompt_input_ids"],
                     prompt_attention_mask=batch["prompt_attention_mask"],
@@ -657,7 +656,18 @@ class DPOTrainer(Trainer):
                     completion_attention_mask=batch["rejected_attention_mask"],
                 )
 
-        return ref_chosen_logps, ref_rejected_logps
+            # Compute rewards if needed (matching concatenated_forward behavior)
+            chosen_rewards = ref_chosen_logps
+            rejected_rewards = ref_rejected_logps
+
+        return {
+            "chosen_logps": ref_chosen_logps,
+            "rejected_logps": ref_rejected_logps,
+            "chosen_logits": ref_chosen_logits,
+            "rejected_logits": ref_rejected_logits,
+            "chosen_rewards": chosen_rewards,
+            "rejected_rewards": rejected_rewards,
+        }
 
     def compute_ref_log_probs_concatenated(self, batch: dict[str, torch.LongTensor]) -> dict:
         """Computes log probabilities of the reference model for a single padded batch of a DPO specific dataset."""
@@ -928,7 +938,7 @@ class DPOTrainer(Trainer):
         prompt_attention_mask: torch.LongTensor,
         completion_input_ids: torch.LongTensor,
         completion_attention_mask: torch.LongTensor,
-    ) -> torch.FloatTensor:
+    ) -> tuple[torch.FloatTensor, torch.FloatTensor]:
         """Regular forward pass that maintains the prompt/completion separation."""
 
         # Concatenate prompt and completion
@@ -944,33 +954,11 @@ class DPOTrainer(Trainer):
             dim=1,
         )
 
-        # Flush left like in original implementation
-        for i in range(attention_mask.size(0)):
-            first_one_idx = torch.nonzero(attention_mask[i])[0].item()
-            input_ids[i] = torch.roll(input_ids[i], shifts=-first_one_idx)
-            attention_mask[i] = torch.roll(attention_mask[i], shifts=-first_one_idx)
-            loss_mask[i] = torch.roll(loss_mask[i], shifts=-first_one_idx)
-
-        # Remove empty columns (optimization from original)
-        empty_cols = torch.sum(attention_mask, dim=0) == 0
-        if empty_cols.any():
-            first_empty_col = torch.nonzero(empty_cols)[0].item()
-            input_ids = input_ids[:, :first_empty_col]
-            attention_mask = attention_mask[:, :first_empty_col]
-            loss_mask = loss_mask[:, :first_empty_col]
-
-        # Apply max length truncation if specified
-        if self.args.max_length is not None:
-            input_ids = input_ids[:, : self.args.max_length]
-            attention_mask = attention_mask[:, : self.args.max_length]
-            loss_mask = loss_mask[:, : self.args.max_length]
-
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
 
-        # Get logits and compute log probabilities
         logits = outputs.logits[:, :-1, :]
         labels = input_ids[:, 1:].clone()
         loss_mask = loss_mask[:, 1:].bool()
@@ -978,19 +966,21 @@ class DPOTrainer(Trainer):
         # Zero out padding in labels where loss_mask is False
         labels[~loss_mask] = 0
 
+        # Keep both logits and log probabilities
+        all_logits = logits.clone()
         per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
 
         # Apply loss mask
         per_token_logps = per_token_logps * loss_mask
 
-        # Handle num_logits_to_keep if enabled
         if self.use_num_logits_to_keep:
             first_compute_index = loss_mask.nonzero(as_tuple=True)[1].min()
             num_logits_to_keep = loss_mask.shape[1] - first_compute_index
             per_token_logps = per_token_logps[:, -num_logits_to_keep:]
             loss_mask = loss_mask[:, -num_logits_to_keep:]
+            all_logits = all_logits[:, -num_logits_to_keep:]
 
-        return per_token_logps.sum(dim=-1)
+        return per_token_logps.sum(dim=-1), all_logits
 
     def get_batch_loss_metrics(
         self,
