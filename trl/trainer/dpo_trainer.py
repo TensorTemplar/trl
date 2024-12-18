@@ -403,9 +403,11 @@ class DPOTrainer(Trainer):
                 self.ref_model = None  # we will use policy model with adapters disabled as reference model
 
         else:
-            self.ref_model = self.accelerator.prepare_model(
-                self.ref_model, device_placement=True, evaluation_mode=True
-            )
+            # print("preparing ref model with accelerator in eval mode")
+            # self.ref_model = self.accelerator.prepare_model(
+            #     self.ref_model, device_placement=True, evaluation_mode=True
+            # )
+            self.ref_model = self.ref_model  # require preparation in the training script
 
         self._peft_has_been_casted_to_bf16 = False
         if peft_config is not None:
