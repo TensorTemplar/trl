@@ -618,7 +618,48 @@ class DPOTrainer(Trainer):
             if self.ref_adapter_name:
                 self.model.set_adapter(self.model_adapter_name or "default")
 
-    def compute_ref_log_probs(self, batch: dict[str, torch.LongTensor]) -> dict:
+
+    def compute_ref_log_probs(self, batch: dict[str, torch.LongTensor]) -> tuple[torch.FloatTensor, torch.FloatTensor]:
+        """Computes log probabilities of the reference model for a single batch."""
+
+        compute_ref_context_manager = amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
+
+        with torch.no_grad(), compute_ref_context_manager:
+            if self.ref_model is None:
+                with self.reference_model_context():
+                    ref_chosen_logps = self.forward(
+                        self.model,
+                        prompt_input_ids=batch["prompt_input_ids"],
+                        prompt_attention_mask=batch["prompt_attention_mask"],
+                        completion_input_ids=batch["chosen_input_ids"],
+                        completion_attention_mask=batch["chosen_attention_mask"],
+                    )
+                    ref_rejected_logps = self.forward(
+                        self.model,
+                        prompt_input_ids=batch["prompt_input_ids"],
+                        prompt_attention_mask=batch["prompt_attention_mask"],
+                        completion_input_ids=batch["rejected_input_ids"],
+                        completion_attention_mask=batch["rejected_attention_mask"],
+                    )
+            else:
+                ref_chosen_logps = self.forward(
+                    self.ref_model,
+                    prompt_input_ids=batch["prompt_input_ids"],
+                    prompt_attention_mask=batch["prompt_attention_mask"],
+                    completion_input_ids=batch["chosen_input_ids"],
+                    completion_attention_mask=batch["chosen_attention_mask"],
+                )
+                ref_rejected_logps = self.forward(
+                    self.ref_model,
+                    prompt_input_ids=batch["prompt_input_ids"],
+                    prompt_attention_mask=batch["prompt_attention_mask"],
+                    completion_input_ids=batch["rejected_input_ids"],
+                    completion_attention_mask=batch["rejected_attention_mask"],
+                )
+
+        return ref_chosen_logps, ref_rejected_logps
+
+    def compute_ref_log_probs_concatenated(self, batch: dict[str, torch.LongTensor]) -> dict:
         """Computes log probabilities of the reference model for a single padded batch of a DPO specific dataset."""
 
         compte_ref_context_manager = amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
@@ -1177,7 +1218,7 @@ class DPOTrainer(Trainer):
             ref_chosen_logps = batch["ref_chosen_logps"]
             ref_rejected_logps = batch["ref_rejected_logps"]
         else:
-            ref_chosen_logps, ref_rejected_logps = self.compute_ref_log_probs(batch)
+            ref_chosen_logps, ref_rejected_logps = self.compute_ref_log_probs_concatenated(batch)
 
         losses, chosen_rewards, rejected_rewards = self.dpo_loss(
             model_output["chosen_logps"], model_output["rejected_logps"], ref_chosen_logps, ref_rejected_logps
