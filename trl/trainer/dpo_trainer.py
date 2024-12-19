@@ -71,6 +71,7 @@ if is_peft_available():
 if is_wandb_available():
     import wandb
 
+ENABLE_PROFILING = os.getenv("ENABLE_PROFILING", "false").lower() == "true"
 
 @dataclass
 class PreferenceCollator(DataCollatorMixin):
@@ -672,7 +673,7 @@ class DPOTrainer(Trainer):
     ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """Compute the DPO loss for a batch of policy and reference model log probabilities."""
 
-        if self.accelerator.is_main_process:
+        if self.accelerator.is_main_process and ENABLE_PROFILING:
             self.log(
                 {
                     "debug/log_probs/chosen_min": chosen_logps.min().item(),
@@ -714,7 +715,7 @@ class DPOTrainer(Trainer):
             ref_logratios = torch.clamp(ref_logratios, min=-20, max=20).to(self.accelerator.device)
             scaling_factor = 0.1
             logits = (logratios - ref_logratios) * scaling_factor
-            if self.accelerator.is_main_process:
+            if self.accelerator.is_main_process and ENABLE_PROFILING:
                 self.log(
                     {
                         "debug/logits_min": logits.min().item(),
@@ -925,7 +926,7 @@ class DPOTrainer(Trainer):
         logits_min = logits.min().item()
         logits_max = logits.max().item()
         logits_mean = logits.mean().item()
-        if self.accelerator.is_main_process:
+        if self.accelerator.is_main_process and ENABLE_PROFILING:
             self.log({
                 "debug/forward/logits_min": logits_min,
                 "debug/forward/logits_max": logits_max,
