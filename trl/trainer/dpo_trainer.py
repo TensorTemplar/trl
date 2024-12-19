@@ -194,13 +194,11 @@ class DPOTrainer(Trainer):
         self,
         model: Union[PreTrainedModel, nn.Module],
         train_dataset: Dataset,
+        processing_class: PreTrainedTokenizerBase,
         args: Optional[Union[ScriptArguments, DPOConfig, ModelConfig]] = None,
         ref_model: Optional[Union[PreTrainedModel, nn.Module]] = None,
         data_collator: Optional[DataCollator] = None,
         eval_dataset: Optional[Union[Dataset, dict[str, Dataset]]] = None,
-        processing_class: Optional[
-            Union[PreTrainedTokenizerBase, BaseImageProcessor, FeatureExtractionMixin, ProcessorMixin]
-        ] = None,
         model_init: Optional[Callable[[], PreTrainedModel]] = None,
         compute_metrics: Optional[Callable[[EvalLoopOutput], dict]] = None,
         callbacks: Optional[list[TrainerCallback]] = None,
@@ -215,10 +213,6 @@ class DPOTrainer(Trainer):
                 "same as `model`, you must pass a copy of it."
             )
         self.ref_model = ref_model
-
-        if processing_class is None:
-            raise ValueError("processing_class must be specified to tokenize a DPO dataset.")
-        self.processing_class = processing_class
 
         if args.loss_type == "kto_pair":
             raise ValueError("Support for kto_pair has been removed in DPOTrainer. Please use KTOTrainer.")
@@ -700,17 +694,15 @@ class DPOTrainer(Trainer):
             self.log(f"chosen_logps: [{chosen_logps.min().item():.3f}, {chosen_logps.max().item():.3f}]")
             self.log(f"rejected_logps: [{rejected_logps.min().item():.3f}, {rejected_logps.max().item():.3f}]")
             self.log(f"ref_chosen_logps: [{ref_chosen_logps.min().item():.3f}, {ref_chosen_logps.max().item():.3f}]")
-            self.log(f"ref_rejected_logps: [{ref_rejected_logps.min().item():.3f}, {ref_rejected_logps.max().item():.3f}]")
+            self.log(
+                f"ref_rejected_logps: [{ref_rejected_logps.min().item():.3f}, {ref_rejected_logps.max().item():.3f}]"
+            )
 
         device = self.accelerator.device
 
         # Get the log ratios for the chosen and rejected responses, ensuring clean copies on the correct device
-        chosen_logratios = chosen_logps.clone().to(device) - (not self.reference_free) * ref_chosen_logps.clone().to(
-            device
-        )
-        rejected_logratios = rejected_logps.clone().to(device) - (
-            not self.reference_free
-        ) * ref_rejected_logps.clone().to(device)
+        chosen_logratios = chosen_logps.to(device) - (not self.reference_free) * ref_chosen_logps.to(device)
+        rejected_logratios = rejected_logps.to(device) - (not self.reference_free) * ref_rejected_logps.to(device)
 
         if self.f_divergence_type == FDivergenceType.ALPHA_DIVERGENCE.value:
             # The alpha-divergence formula: (1 - u^-alpha) / alpha
@@ -884,40 +876,63 @@ class DPOTrainer(Trainer):
 
         # Create loss mask that zeros out prompt portion
         loss_mask = torch.cat(
-            (
-                torch.zeros_like(prompt_attention_mask),
-                completion_attention_mask,
-            ),
+            (torch.zeros_like(prompt_attention_mask), completion_attention_mask),
             dim=1,
         )
+
+        # Flush left to reduce memory usage
+        for i in range(attention_mask.size(0)):
+            if (first_ones := torch.nonzero(attention_mask[i])).numel() > 0:
+                first_one_idx = first_ones[0].item()
+                input_ids[i] = torch.roll(input_ids[i], shifts=-first_one_idx)
+                attention_mask[i] = torch.roll(attention_mask[i], shifts=-first_one_idx)
+                loss_mask[i] = torch.roll(loss_mask[i], shifts=-first_one_idx)
+
+        # Remove empty columns
+        empty_cols = torch.sum(attention_mask, dim=0) == 0
+        if empty_cols.any():
+            first_empty_col = torch.nonzero(empty_cols)[0].item()
+            input_ids = input_ids[:, :first_empty_col]
+            attention_mask = attention_mask[:, :first_empty_col]
+            loss_mask = loss_mask[:, :first_empty_col]
+
+        if self.max_length is not None:
+            input_ids = input_ids[:, :self.max_length]
+            attention_mask = attention_mask[:, :self.max_length]
+            loss_mask = loss_mask[:, :self.max_length]
+
+        model_kwargs = {}
+        if self.use_num_logits_to_keep:
+            first_compute_index = loss_mask.nonzero(as_tuple=True)[1].min()
+            num_logits_to_keep = loss_mask.shape[1] - first_compute_index
+            model_kwargs["num_logits_to_keep"] = num_logits_to_keep.item() + 1
 
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            **model_kwargs,
         )
 
+        # Offset logits and prepare labels
         logits = outputs.logits[:, :-1, :]
         labels = input_ids[:, 1:].clone()
         loss_mask = loss_mask[:, 1:].bool()
 
-        # Zero out padding in labels where loss_mask is False
+        if self.use_num_logits_to_keep:
+            labels = labels[:, -num_logits_to_keep:]
+            loss_mask = loss_mask[:, -num_logits_to_keep:]
+
+        # Zero out padding in labels
         labels[~loss_mask] = 0
 
-        # Keep both logits and log probabilities
-        all_logits = logits.clone()
         per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+        per_token_logps[~loss_mask] = 0
 
-        # Apply loss mask
-        per_token_logps = per_token_logps * loss_mask
-
-        if self.use_num_logits_to_keep:
-            first_compute_index = loss_mask.nonzero(as_tuple=True)[1].min()
-            num_logits_to_keep = loss_mask.shape[1] - first_compute_index
-            per_token_logps = per_token_logps[:, -num_logits_to_keep:]
-            loss_mask = loss_mask[:, -num_logits_to_keep:]
-            all_logits = all_logits[:, -num_logits_to_keep:]
-
-        return per_token_logps.sum(dim=-1), all_logits
+        # normalize by sequence length for IPO loss type
+        if self.loss_type == "ipo":
+            return per_token_logps.sum(dim=-1) / loss_mask.sum(-1), logits
+        else:
+            return per_token_logps.sum(dim=-1), logits
 
     def get_batch_loss_metrics(
         self,
