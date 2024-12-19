@@ -714,6 +714,14 @@ class DPOTrainer(Trainer):
             ref_logratios = torch.clamp(ref_logratios, min=-20, max=20).to(self.accelerator.device)
             scaling_factor = 0.1
             logits = (logratios - ref_logratios) * scaling_factor
+            if self.accelerator.is_main_process:
+                self.log(
+                    {
+                        "debug/logits_min": logits.min().item(),
+                        "debug/logits_max": logits.max().item(),
+                        "debug/logits_mean": logits.mean().item(),
+                    }
+                )
 
             if self.f_divergence_type == FDivergenceType.JS_DIVERGENCE.value:
                 # The js-divergence formula: log(2 * u / (1 + u))
@@ -918,7 +926,12 @@ class DPOTrainer(Trainer):
 
         # normalize by sequence length for IPO loss type
         if self.loss_type == "ipo":
-            return per_token_logps.sum(dim=-1) / loss_mask.sum(-1), logits
+            denom = loss_mask.sum(-1)
+            if denom == 0:
+                denom = torch.ones_like(denom)
+                if self.accelerator.is_main_process:
+                    self.log({"debug/denom": denom.item()})
+            return per_token_logps.sum(dim=-1) / denom, logits
 
         return per_token_logps.sum(dim=-1), logits
 
