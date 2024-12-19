@@ -945,7 +945,7 @@ class DPOTrainer(Trainer):
         metrics = {}
 
         # Forward passes for policy model
-        chosen_logps = self.forward(
+        chosen_logps, chosen_logits = self.forward(
             model,
             prompt_input_ids=batch["prompt_input_ids"],
             prompt_attention_mask=batch["prompt_attention_mask"],
@@ -953,7 +953,7 @@ class DPOTrainer(Trainer):
             completion_attention_mask=batch["chosen_attention_mask"],
         )
 
-        rejected_logps = self.forward(
+        rejected_logps, rejected_logits = self.forward(
             model,
             prompt_input_ids=batch["prompt_input_ids"],
             prompt_attention_mask=batch["prompt_attention_mask"],
@@ -969,14 +969,14 @@ class DPOTrainer(Trainer):
             with torch.no_grad():
                 if self.ref_model is None:
                     with self.reference_model_context():
-                        ref_chosen_logps = self.forward(
+                        ref_chosen_logps, _ = self.forward(
                             model,
                             prompt_input_ids=batch["prompt_input_ids"],
                             prompt_attention_mask=batch["prompt_attention_mask"],
                             completion_input_ids=batch["chosen_input_ids"],
                             completion_attention_mask=batch["chosen_attention_mask"],
                         )
-                        ref_rejected_logps = self.forward(
+                        ref_rejected_logps, _ = self.forward(
                             model,
                             prompt_input_ids=batch["prompt_input_ids"],
                             prompt_attention_mask=batch["prompt_attention_mask"],
@@ -984,14 +984,14 @@ class DPOTrainer(Trainer):
                             completion_attention_mask=batch["rejected_attention_mask"],
                         )
                 else:
-                    ref_chosen_logps = self.forward(
+                    ref_chosen_logps, _ = self.forward(
                         self.ref_model,
                         prompt_input_ids=batch["prompt_input_ids"],
                         prompt_attention_mask=batch["prompt_attention_mask"],
                         completion_input_ids=batch["chosen_input_ids"],
                         completion_attention_mask=batch["chosen_attention_mask"],
                     )
-                    ref_rejected_logps = self.forward(
+                    ref_rejected_logps, _ = self.forward(
                         self.ref_model,
                         prompt_input_ids=batch["prompt_input_ids"],
                         prompt_attention_mask=batch["prompt_attention_mask"],
@@ -1017,6 +1017,8 @@ class DPOTrainer(Trainer):
                 f"{prefix}rewards/margins": (chosen_rewards - rejected_rewards).mean(),
                 f"{prefix}logps/chosen": chosen_logps.mean(),
                 f"{prefix}logps/rejected": rejected_logps.mean(),
+                f"{prefix}logits/chosen": chosen_logits.mean(),
+                f"{prefix}logits/rejected": rejected_logits.mean(),
             }
         )
 
