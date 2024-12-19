@@ -695,6 +695,13 @@ class DPOTrainer(Trainer):
             The `chosen_rewards` and `rejected_rewards` tensors contain the rewards for the chosen and rejected
             responses, respectively.
         """
+        if self.accelerator.state.is_main_process:
+            print(f"Log probs ranges:")
+            print(f"chosen_logps: [{chosen_logps.min().item():.3f}, {chosen_logps.max().item():.3f}]")
+            print(f"rejected_logps: [{rejected_logps.min().item():.3f}, {rejected_logps.max().item():.3f}]")
+            print(f"ref_chosen_logps: [{ref_chosen_logps.min().item():.3f}, {ref_chosen_logps.max().item():.3f}]")
+            print(f"ref_rejected_logps: [{ref_rejected_logps.min().item():.3f}, {ref_rejected_logps.max().item():.3f}]")
+
         device = self.accelerator.device
 
         # Get the log ratios for the chosen and rejected responses, ensuring clean copies on the correct device
@@ -723,9 +730,10 @@ class DPOTrainer(Trainer):
             else:
                 ref_logratios = ref_chosen_logps - ref_rejected_logps
 
-            logratios = logratios.to(self.accelerator.device)
-            ref_logratios = ref_logratios.to(self.accelerator.device)
-            logits = logratios - ref_logratios
+            logratios = torch.clamp(logratios, min=-20, max=20).to(self.accelerator.device)
+            ref_logratios = torch.clamp(ref_logratios, min=-20, max=20).to(self.accelerator.device)
+            scaling_factor = 0.1
+            logits = (logratios - ref_logratios) * scaling_factor
 
             if self.f_divergence_type == FDivergenceType.JS_DIVERGENCE.value:
                 # The js-divergence formula: log(2 * u / (1 + u))
