@@ -921,16 +921,28 @@ class DPOTrainer(Trainer):
         # Zero out padding in labels
         labels[~loss_mask] = 0
 
+
+        logits_min = logits.min().item()
+        logits_max = logits.max().item()
+        logits_mean = logits.mean().item()
+        if self.accelerator.is_main_process:
+            self.log({
+                "debug/forward/logits_min": logits_min,
+                "debug/forward/logits_max": logits_max,
+                "debug/forward/logits_mean": logits_mean,
+            })
+
+        # Check for NaNs in logits
+        if torch.isnan(logits).any():
+            raise ValueError("NaN detected in logits")
+
         per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
         per_token_logps[~loss_mask] = 0
 
         # normalize by sequence length for IPO loss type
         if self.loss_type == "ipo":
             denom = loss_mask.sum(-1)
-            if denom == 0:
-                denom = torch.ones_like(denom)
-                if self.accelerator.is_main_process:
-                    self.log({"debug/denom": denom.item()})
+            denom = torch.clamp(denom, min=1)
             return per_token_logps.sum(dim=-1) / denom, logits
 
         return per_token_logps.sum(dim=-1), logits
