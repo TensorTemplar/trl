@@ -670,37 +670,25 @@ class DPOTrainer(Trainer):
         ref_chosen_logps: torch.FloatTensor,
         ref_rejected_logps: torch.FloatTensor,
     ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
-        """
-        Compute the DPO loss for a batch of policy and reference model log probabilities.
+        """Compute the DPO loss for a batch of policy and reference model log probabilities."""
 
-        Args:
-            chosen_logps (`torch.FloatTensor`):
-                Log probabilities of the model for the chosen responses. Shape: `(batch_size,)`.
-            rejected_logps (`torch.FloatTensor`):
-                Log probabilities of the model for the rejected responses. Shape: `(batch_size,)`.
-            ref_chosen_logps (`torch.FloatTensor`):
-                Log probabilities of the reference model for the chosen responses. Shape: `(batch_size,)`.
-            ref_rejected_logps (`torch.FloatTensor`):
-                Log probabilities of the reference model for the rejected responses. Shape: `(batch_size,)`.
-
-        Returns:
-            A tuple of three tensors: `(losses, chosen_rewards, rejected_rewards)`.
-            The losses tensor contains the DPO loss for each example in the batch.
-            The `chosen_rewards` and `rejected_rewards` tensors contain the rewards for the chosen and rejected
-            responses, respectively.
-        """
-        if self.accelerator.state.is_main_process:
-            self.log(f"Log probs ranges:")
-            self.log(f"chosen_logps: [{chosen_logps.min().item():.3f}, {chosen_logps.max().item():.3f}]")
-            self.log(f"rejected_logps: [{rejected_logps.min().item():.3f}, {rejected_logps.max().item():.3f}]")
-            self.log(f"ref_chosen_logps: [{ref_chosen_logps.min().item():.3f}, {ref_chosen_logps.max().item():.3f}]")
+        if self.accelerator.is_main_process:
             self.log(
-                f"ref_rejected_logps: [{ref_rejected_logps.min().item():.3f}, {ref_rejected_logps.max().item():.3f}]"
+                {
+                    "debug/log_probs/chosen_min": chosen_logps.min().item(),
+                    "debug/log_probs/chosen_max": chosen_logps.max().item(),
+                    "debug/log_probs/rejected_min": rejected_logps.min().item(),
+                    "debug/log_probs/rejected_max": rejected_logps.max().item(),
+                    "debug/ref_log_probs/chosen_min": ref_chosen_logps.min().item(),
+                    "debug/ref_log_probs/chosen_max": ref_chosen_logps.max().item(),
+                    "debug/ref_log_probs/rejected_min": ref_rejected_logps.min().item(),
+                    "debug/ref_log_probs/rejected_max": ref_rejected_logps.max().item(),
+                }
             )
 
         device = self.accelerator.device
 
-        # Get the log ratios for the chosen and rejected responses, ensuring clean copies on the correct device
+        # Get the log ratios for the chosen and rejected responses
         chosen_logratios = chosen_logps.to(device) - (not self.reference_free) * ref_chosen_logps.to(device)
         rejected_logratios = rejected_logps.to(device) - (not self.reference_free) * ref_rejected_logps.to(device)
 
@@ -897,9 +885,9 @@ class DPOTrainer(Trainer):
             loss_mask = loss_mask[:, :first_empty_col]
 
         if self.max_length is not None:
-            input_ids = input_ids[:, :self.max_length]
-            attention_mask = attention_mask[:, :self.max_length]
-            loss_mask = loss_mask[:, :self.max_length]
+            input_ids = input_ids[:, : self.max_length]
+            attention_mask = attention_mask[:, : self.max_length]
+            loss_mask = loss_mask[:, : self.max_length]
 
         model_kwargs = {}
         if self.use_num_logits_to_keep:
@@ -931,8 +919,8 @@ class DPOTrainer(Trainer):
         # normalize by sequence length for IPO loss type
         if self.loss_type == "ipo":
             return per_token_logps.sum(dim=-1) / loss_mask.sum(-1), logits
-        else:
-            return per_token_logps.sum(dim=-1), logits
+
+        return per_token_logps.sum(dim=-1), logits
 
     def get_batch_loss_metrics(
         self,
