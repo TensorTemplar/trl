@@ -696,11 +696,11 @@ class DPOTrainer(Trainer):
             responses, respectively.
         """
         if self.accelerator.state.is_main_process:
-            print(f"Log probs ranges:")
-            print(f"chosen_logps: [{chosen_logps.min().item():.3f}, {chosen_logps.max().item():.3f}]")
-            print(f"rejected_logps: [{rejected_logps.min().item():.3f}, {rejected_logps.max().item():.3f}]")
-            print(f"ref_chosen_logps: [{ref_chosen_logps.min().item():.3f}, {ref_chosen_logps.max().item():.3f}]")
-            print(f"ref_rejected_logps: [{ref_rejected_logps.min().item():.3f}, {ref_rejected_logps.max().item():.3f}]")
+            self.log(f"Log probs ranges:")
+            self.log(f"chosen_logps: [{chosen_logps.min().item():.3f}, {chosen_logps.max().item():.3f}]")
+            self.log(f"rejected_logps: [{rejected_logps.min().item():.3f}, {rejected_logps.max().item():.3f}]")
+            self.log(f"ref_chosen_logps: [{ref_chosen_logps.min().item():.3f}, {ref_chosen_logps.max().item():.3f}]")
+            self.log(f"ref_rejected_logps: [{ref_rejected_logps.min().item():.3f}, {ref_rejected_logps.max().item():.3f}]")
 
         device = self.accelerator.device
 
